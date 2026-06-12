@@ -2,9 +2,8 @@ name: build
 
 on:
   push:
-    branches: [main]
     tags: ['v*']        # pushing a version tag cuts a release
-  workflow_dispatch:
+
 
 permissions:
   contents: write       # needed to create the GitHub Release
