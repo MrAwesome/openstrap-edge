@@ -11,6 +11,7 @@ import '../../theme/tokens.dart';
 import '../kit/kit.dart';
 import '../kit/charts.dart';
 import 'metric_row.dart';
+import 'trend_screen.dart';
 
 String hm(num? minutes) {
   if (minutes == null) return '—';
@@ -141,19 +142,22 @@ class HeartDayCard extends StatelessWidget {
             ])),
           ],
 
-          // HRV — full Task-Force suite, each with what-it-means.
+          // HRV — full Task-Force suite, each tappable into its trend.
           if (hrv != null) ...[
             const SizedBox(height: Sp.x6),
             SectionHeader('Heart-rate variability'),
             MetricGroup([
-              MetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'RMSSD', info: infoFor('rmssd'),
-                  value: '${hrv['rmssd'] ?? '—'}', unit: 'ms'),
+              TrendMetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'RMSSD', info: infoFor('rmssd'),
+                  value: '${hrv['rmssd'] ?? '—'}', unit: 'ms', metric: 'hrv', trendTitle: 'HRV (RMSSD)'),
               if (hrv['sdnn'] != null)
-                MetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'SDNN', info: infoFor('sdnn'),
-                    value: '${hrv['sdnn']}', unit: 'ms'),
+                TrendMetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'SDNN', info: infoFor('sdnn'),
+                    value: '${hrv['sdnn']}', unit: 'ms', metric: 'sdnn', trendTitle: 'HRV (SDNN)'),
               if (hrv['lf_hf'] != null)
-                MetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'LF / HF', info: infoFor('lf_hf'),
-                    value: '${hrv['lf_hf']}'),
+                TrendMetricRow(icon: Ic.pulse, accent: AppColors.good, label: 'LF / HF', info: infoFor('lf_hf'),
+                    value: '${hrv['lf_hf']}', metric: 'lf_hf', trendTitle: 'LF / HF'),
+              if (hrv['cv'] != null)
+                TrendMetricRow(icon: Ic.chart, accent: AppColors.good, label: 'HRV stability', info: infoFor('hrv_cv'),
+                    value: '${hrv['cv']}', unit: '%', metric: 'hrv_cv', trendTitle: 'HRV stability (CV)'),
               if (hrv['baseline'] != null)
                 MetricRow(icon: Ic.chart, accent: AppColors.inkSoft, label: 'Your baseline',
                     info: 'Your typical RMSSD — recovery is measured against this.',
@@ -203,8 +207,9 @@ class HeartDayCard extends StatelessWidget {
               MetricRow(icon: Ic.moon, accent: AppColors.loadDetraining, label: 'Sleeping HR',
                   info: infoFor('sleeping_hr'), value: '${noct['sleeping_hr_avg']}', unit: 'bpm'),
               if (noct['dip_pct'] != null)
-                MetricRow(icon: Ic.down, accent: AppColors.good, label: 'Nocturnal dip',
-                    info: infoFor('nocturnal_dip'), value: '${((noct['dip_pct'] as num) * 100).round()}', unit: '%'),
+                TrendMetricRow(icon: Ic.down, accent: AppColors.good, label: 'Nocturnal dip',
+                    info: infoFor('dip'), value: '${((noct['dip_pct'] as num) * 100).round()}', unit: '%',
+                    metric: 'dip', trendTitle: 'Nocturnal HR dip'),
               if (noct['vs_baseline_bpm'] != null)
                 MetricRow(icon: Ic.chart, accent: AppColors.inkSoft, label: 'vs baseline',
                     info: 'Tonight vs your typical sleeping heart rate.',
@@ -231,6 +236,13 @@ class HeartDayCard extends StatelessWidget {
             const SizedBox(height: Sp.x6),
             SectionHeader('Illness watch'),
             _IllnessCard(illness),
+          ],
+
+          // Irregular-rhythm screen (Poincaré from nocturnal RR) — shown once it has data.
+          if (d['irregular'] is Map && (d['irregular']['confidence'] as num? ?? 0) > 0) ...[
+            const SizedBox(height: Sp.x6),
+            SectionHeader('Irregular-beat watch'),
+            _IrregularCard(d['irregular'] as Map),
           ],
 
           // What affected this — display-only (no navigation loop), properly padded.
@@ -316,6 +328,45 @@ class _IllnessCard extends StatelessWidget {
               DetailRow(label: dr['label']?.toString() ?? '', value: dr['detail']?.toString() ?? ''),
           ],
         )),
+      ],
+    ]));
+  }
+}
+
+// Irregular-rhythm screen card — green "looks regular" vs amber "irregular pattern".
+// A SCREEN, not a diagnosis. Conservative; shows the Poincaré descriptors.
+class _IrregularCard extends StatelessWidget {
+  final Map irr;
+  const _IrregularCard(this.irr);
+  @override
+  Widget build(BuildContext context) {
+    final flag = irr['flag'] == true;
+    final accent = flag ? AppColors.warn : AppColors.good;
+    final softBg = flag ? AppColors.warnSoft : AppColors.goodSoft;
+    return ProCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Padding(padding: const EdgeInsets.all(Sp.x4), child: Row(children: [
+        Container(
+          padding: const EdgeInsets.all(9),
+          decoration: BoxDecoration(color: softBg, borderRadius: BorderRadius.circular(R.chip)),
+          child: AppIcon(flag ? Ic.info : Ic.check, size: 17, color: accent),
+        ),
+        const SizedBox(width: Sp.x3),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(flag ? 'Irregular rhythm pattern' : 'Rhythm looks regular',
+              style: AppText.label.copyWith(color: accent)),
+          const SizedBox(height: 2),
+          Text(flag
+              ? 'Your beat-to-beat timing was unusually irregular overnight. A screen, not a diagnosis — if it persists, see a clinician.'
+              : 'Beat-to-beat timing was within a normal range overnight.',
+              style: AppText.captionMuted),
+        ])),
+      ])),
+      if (irr['sd1'] != null && irr['sd2'] != null) ...[
+        const Divider(height: 1, color: AppColors.divider),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: Sp.x4, vertical: Sp.x2), child: Column(children: [
+          DetailRow(label: 'Poincaré SD1 / SD2', value: '${irr['sd1']} / ${irr['sd2']} ms'),
+          if (irr['pnn50'] != null) DetailRow(label: 'pNN50', value: '${irr['pnn50']}%'),
+        ])),
       ],
     ]));
   }

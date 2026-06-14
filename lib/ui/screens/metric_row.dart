@@ -36,6 +36,14 @@ const Map<String, String> kMetricInfo = {
   'hrr60': 'How fast your HR drops a minute after peak effort — fitness marker.',
   'illness': 'A combined resting-HR / HRV / temperature signal that can flag early illness.',
   'debt': 'Sleep you owe from falling short of your need on recent nights.',
+  'hrv_cv': 'How steady your nightly HRV is — lower, stable is better.',
+  'readiness': 'A blend of HRV recovery and sleep — your day-ahead capacity.',
+  'vo2max': 'Estimated aerobic fitness from your max vs resting heart rate.',
+  'form': 'Freshness: fitness minus fatigue. Positive means well-rested.',
+  'fitness': 'Chronic training load — your built-up fitness (Banister).',
+  'fatigue': 'Acute training load — recent fatigue (Banister).',
+  'monotony': 'Sameness of daily strain — very high can raise injury risk.',
+  'dip': 'How far your heart rate falls in sleep — a bigger dip is better.',
 };
 
 String? infoFor(String key) => kMetricInfo[key];
