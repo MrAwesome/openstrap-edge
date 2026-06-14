@@ -42,7 +42,7 @@ dependencies:
   # OTA self-update (Android sideload): read our own version, download + install the
   # signed APK from the backend's update pointer, with a browser fallback.
   package_info_plus: ^8.1.0
-  ota_update: ^6.0.0
+  ota_update: ^7.1.0
   url_launcher: ^6.3.0
 
 dev_dependencies:

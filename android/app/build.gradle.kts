@@ -27,6 +27,8 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // Required by ota_update 7.x (desugars java.time/java.nio APIs on older API levels).
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -72,4 +74,9 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Backs isCoreLibraryDesugaringEnabled (required by ota_update 7.x).
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
