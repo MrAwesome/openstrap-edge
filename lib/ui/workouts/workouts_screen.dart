@@ -21,6 +21,36 @@ const _exercises = [
 const _ranges = ['Today', 'Week', 'Month', '3M'];
 const _rangeKey = ['week', 'week', 'month', 'quarter']; // Today filters week to today
 
+// Zone palette (Z1→Z5), shared by the bar + legend.
+const _zoneColors = [AppColors.cool, AppColors.loadDetraining, AppColors.good, AppColors.warn, AppColors.coral];
+
+IconData _typeIcon(String? type) {
+  for (final e in _exercises) { if (e.$1 == type) return e.$3; }
+  return Ic.run;
+}
+
+String _typeLabel(String? type) {
+  if (type == null || type.isEmpty) return 'Workout';
+  return type[0].toUpperCase() + type.substring(1);
+}
+
+// Relative-ish date for a session start (local).
+String _whenLabel(int? startTs) {
+  if (startTs == null || startTs == 0) return '';
+  final d = DateTime.fromMillisecondsSinceEpoch(startTs * 1000).toLocal();
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final that = DateTime(d.year, d.month, d.day);
+  final diff = today.difference(that).inDays;
+  final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+  final ap = d.hour < 12 ? 'AM' : 'PM';
+  final time = '$h:${d.minute.toString().padLeft(2, '0')} $ap';
+  if (diff == 0) return 'Today · $time';
+  if (diff == 1) return 'Yesterday · $time';
+  const mon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return '${mon[d.month - 1]} ${d.day} · $time';
+}
+
 /// Bottom-sheet exercise picker → starts a workout → opens the live screen.
 Future<void> startWorkoutFlow(BuildContext context) async {
   final type = await showModalBottomSheet<String>(
@@ -124,14 +154,19 @@ class _WorkoutsScreenState extends State<WorkoutsScreen> {
                 ],
                 Text('Workouts', style: AppText.h1),
               ]),
-              const SizedBox(height: Sp.x3),
-              Center(child: SegToggle(options: _ranges, index: _range, onChanged: (i) { setState(() => _range = i); _load(); })),
+              const SizedBox(height: Sp.x4),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: SegToggle(options: _ranges, index: _range, onChanged: (i) { setState(() => _range = i); _load(); }),
+              ),
               const SizedBox(height: Sp.x4),
               if (_loading)
                 const Padding(padding: EdgeInsets.symmetric(vertical: Sp.x6), child: Center(child: CircularProgressIndicator()))
               else ...[
-                if (_range != 0 && summary != null) _summary(summary),
-                if (_range != 0 && summary != null) const SizedBox(height: Sp.x4),
+                if (_range != 0 && summary != null && (summary['count'] ?? 0) > 0) ...[
+                  _SummaryHero(summary: summary, range: _ranges[_range], workouts: list),
+                  const SizedBox(height: Sp.x4),
+                ],
                 if (list.isEmpty)
                   ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x6), child: Center(
                     child: Column(children: [
@@ -142,8 +177,10 @@ class _WorkoutsScreenState extends State<WorkoutsScreen> {
                       Text('Tap Start, or an effort will be auto-detected.', style: AppText.captionMuted, textAlign: TextAlign.center),
                     ]),
                   )))
-                else
+                else ...[
+                  SectionHeader(_range == 0 ? 'Today' : 'Sessions'),
                   for (final w in list) _WorkoutTile(w as Map<String, dynamic>),
+                ],
               ],
             ],
           ),
@@ -151,30 +188,69 @@ class _WorkoutsScreenState extends State<WorkoutsScreen> {
       ),
     );
   }
+}
 
-  Widget _summary(Map<String, dynamic> s) {
-    final byType = (s['by_type'] as Map?) ?? const {};
-    final types = byType.entries.map((e) => '${(e.value as Map)['count']} ${e.key}').join(' · ');
-    return ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x4), child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [
-        _stat('${s['count'] ?? 0}', 'workouts'),
-        const SizedBox(width: Sp.x5),
-        _stat(hm(s['total_min'] as num?), 'active time'),
-        const SizedBox(width: Sp.x5),
-        _stat('${s['total_calories'] ?? 0}', 'kcal'),
+/// Training-summary hero — total time + count/kcal/avg-strain + zone distribution.
+class _SummaryHero extends StatelessWidget {
+  final Map<String, dynamic> summary;
+  final String range;
+  final List<dynamic> workouts;
+  const _SummaryHero({required this.summary, required this.range, required this.workouts});
+
+  @override
+  Widget build(BuildContext context) {
+    final count = (summary['count'] as num?)?.toInt() ?? 0;
+    final totalMin = summary['total_min'] as num?;
+    final kcal = (summary['total_calories'] as num?)?.toInt() ?? 0;
+    final zoneMin = ((summary['zone_min'] as List?) ?? const [])
+        .map((e) => (e as num).toDouble()).toList();
+    // Average strain across done sessions in view.
+    final strains = workouts
+        .where((w) => (w as Map)['status'] != 'live')
+        .map((w) => ((w as Map)['strain'] as num?)?.toDouble() ?? 0)
+        .where((v) => v > 0).toList();
+    final avgStrain = strains.isEmpty ? null : strains.reduce((a, b) => a + b) / strains.length;
+
+    return GlowCard(
+      padding: const EdgeInsets.all(Sp.x6),
+      glow: AppColors.coral,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('TRAINING · ${range.toUpperCase()}', style: AppText.overline),
+        const SizedBox(height: Sp.x4),
+        Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+          Text(hm(totalMin), style: AppText.display),
+          const SizedBox(width: Sp.x2),
+          Padding(padding: const EdgeInsets.only(bottom: 8), child: Text('active', style: AppText.bodySoft)),
+        ]),
+        const SizedBox(height: Sp.x5),
+        Row(children: [
+          _miniStat('$count', 'workouts'),
+          _miniStat('$kcal', 'kcal'),
+          _miniStat(avgStrain == null ? '—' : avgStrain.toStringAsFixed(1), 'avg strain'),
+        ]),
+        if (zoneMin.length == 5 && zoneMin.any((v) => v > 0)) ...[
+          const SizedBox(height: Sp.x5),
+          Text('TIME IN ZONES', style: AppText.overline),
+          const SizedBox(height: Sp.x3),
+          SegmentBar(zoneMin, _zoneColors, height: 12),
+          const SizedBox(height: Sp.x3),
+          Wrap(spacing: Sp.x4, runSpacing: Sp.x2, children: [
+            for (int i = 0; i < 5; i++)
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                Container(width: 9, height: 9, decoration: BoxDecoration(color: _zoneColors[i], shape: BoxShape.circle)),
+                const SizedBox(width: Sp.x2),
+                Text('Z${i + 1} · ${zoneMin[i].round()}m', style: AppText.caption),
+              ]),
+          ]),
+        ],
       ]),
-      if (types.isNotEmpty) ...[
-        const SizedBox(height: Sp.x3),
-        Text(types, style: AppText.captionMuted),
-      ],
-    ])));
+    );
   }
 
-  Widget _stat(String v, String label) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+  Widget _miniStat(String v, String label) => Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
     Text(v, style: AppText.h2),
     Text(label, style: AppText.captionMuted),
-  ]);
+  ]));
 }
 
 class _WorkoutTile extends StatelessWidget {
@@ -183,6 +259,7 @@ class _WorkoutTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final live = w['status'] == 'live';
+    final strain = (w['strain'] as num?);
     return Padding(
       padding: const EdgeInsets.only(bottom: Sp.x3),
       child: ProCard(
@@ -190,20 +267,27 @@ class _WorkoutTile extends StatelessWidget {
           builder: (_) => WorkoutDetailScreen(id: w['id'] as String))),
         padding: const EdgeInsets.all(Sp.x4),
         child: Row(children: [
-          Container(padding: const EdgeInsets.all(10),
+          Container(padding: const EdgeInsets.all(11),
             decoration: BoxDecoration(color: AppColors.coral.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(R.chip)),
-            child: const AppIcon(Ic.run, size: 18, color: AppColors.coral)),
+            child: AppIcon(_typeIcon(w['type'] as String?), size: 20, color: AppColors.coral)),
           const SizedBox(width: Sp.x3),
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
-              Text('${w['type']}'.toUpperCase(), style: AppText.label),
+              Text(_typeLabel(w['type'] as String?), style: AppText.label),
               if (w['source'] == 'auto') ...[const SizedBox(width: Sp.x2), const Tag('AUTO', color: AppColors.inkMuted)],
               if (live) ...[const SizedBox(width: Sp.x2), const Tag('LIVE', color: AppColors.coral)],
             ]),
             const SizedBox(height: 2),
-            Text('${hm(w['duration_min'] as num?)} · ${w['avg_hr'] ?? '—'} bpm · strain ${w['strain'] ?? '—'}',
+            Text('${_whenLabel(w['start_ts'] as int?)} · ${hm(w['duration_min'] as num?)} · ${w['avg_hr'] ?? '—'} bpm',
                 style: AppText.captionMuted),
           ])),
+          if (!live) ...[
+            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Text(strain == null ? '—' : strain.toStringAsFixed(1), style: AppText.metricSm.copyWith(fontSize: 18)),
+              Text('strain', style: AppText.captionMuted),
+            ]),
+            const SizedBox(width: Sp.x2),
+          ],
           const AppIcon(Icons.chevron_right, size: 18, color: AppColors.inkMuted),
         ]),
       ),
@@ -214,7 +298,8 @@ class _WorkoutTile extends StatelessWidget {
 /// Live workout — elapsed timer + recording state + Stop. The actual data records
 /// via the existing background BLE keepalive (foreground service / iOS restoration),
 /// so it keeps recording even if the app is backgrounded; the breakdown is computed
-/// server-side on Stop regardless.
+/// server-side on Stop regardless. If you forget to stop, the server auto-closes it
+/// once your heart rate returns to baseline.
 class LiveWorkoutScreen extends StatefulWidget {
   final String workoutId;
   final String type;
@@ -274,7 +359,8 @@ class _LiveWorkoutScreenState extends State<LiveWorkoutScreen> {
           Text('Recording', style: AppText.body.copyWith(color: AppColors.onNightSoft)),
         ]),
         const SizedBox(height: Sp.x4),
-        Text('Keeps recording in the background — your data is safe even if you leave the app.',
+        Text('Keeps recording in the background — your data is safe even if you leave the app. '
+            'Forget to stop? It auto-ends when your heart rate settles.',
             textAlign: TextAlign.center, style: AppText.caption.copyWith(color: AppColors.onNightSoft)),
         const Spacer(),
         SizedBox(width: double.infinity, child: FilledButton(
@@ -320,46 +406,159 @@ class _WorkoutDetailBodyState extends State<_WorkoutDetailBody> {
     try { final d = await api.getWorkout(widget.id); if (mounted) setState(() { _d = d; _loading = false; }); }
     catch (_) { if (mounted) setState(() => _loading = false); }
   }
+
+  num? _n(Object? v) => v is num ? v : null;
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
     final d = _d;
     if (d == null) return Center(child: Text('Not found', style: AppText.captionMuted));
+
     final hr = (d['hr'] as List?)?.map((e) => ((e as Map)['v'] as num?)?.toDouble() ?? 0).where((v) => v > 0).toList() ?? <double>[];
-    final z = (d['zones'] as Map?);
-    return ListView(padding: const EdgeInsets.all(Sp.x4), children: [
-      ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x4), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('${d['type']}'.toUpperCase(), style: AppText.overline),
-        const SizedBox(height: Sp.x2),
-        Text(hm(d['duration_min'] as num?), style: AppText.metric),
-        const SizedBox(height: Sp.x2),
-        Text('avg ${d['avg_hr'] ?? '—'} · max ${d['max_hr'] ?? '—'} bpm · strain ${d['strain'] ?? '—'} · ${d['calories'] ?? 0} kcal',
-            style: AppText.captionMuted),
-      ]))),
+    final bands = (d['zone_bands'] as List?)?.whereType<Map>().toList() ?? const [];
+    final curve = (d['recovery_curve'] as List?)?.whereType<Map>().toList() ?? const [];
+    final live = d['status'] == 'live';
+    final strain = _n(d['strain']);
+    final drift = _n(d['hr_drift_pct']);
+    final ttp = _n(d['time_to_peak_min']);
+
+    return ListView(padding: const EdgeInsets.fromLTRB(Sp.x4, Sp.x4, Sp.x4, Sp.x10), children: [
+      // ── HERO ──
+      GlowCard(
+        padding: const EdgeInsets.all(Sp.x6),
+        glow: AppColors.coral,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Container(padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: AppColors.coral.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(R.chip)),
+              child: AppIcon(_typeIcon(d['type'] as String?), size: 20, color: AppColors.coral)),
+            const SizedBox(width: Sp.x3),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(_typeLabel(d['type'] as String?).toUpperCase(), style: AppText.overline),
+              Text(_whenLabel(d['start_ts'] as int?), style: AppText.captionMuted),
+            ])),
+            if (d['source'] == 'auto') const Tag('AUTO', color: AppColors.inkMuted),
+            if (live) const Tag('LIVE', color: AppColors.coral),
+          ]),
+          const SizedBox(height: Sp.x5),
+          Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(hm(d['duration_min'] as num?), style: AppText.display),
+              const SizedBox(height: Sp.x1),
+              Text('duration', style: AppText.bodySoft),
+            ])),
+            if (strain != null)
+              RingStat(
+                t: (strain / 21).clamp(0.0, 1.0), color: AppColors.coral, size: 92, stroke: 11,
+                center: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text(strain.toStringAsFixed(1), style: AppText.metricSm),
+                  Text('strain', style: AppText.captionMuted),
+                ]),
+              ),
+          ]),
+          const SizedBox(height: Sp.x5),
+          Row(children: [
+            _heroStat('${d['avg_hr'] ?? '—'}', 'avg bpm'),
+            _heroStat('${d['max_hr'] ?? '—'}', 'max bpm'),
+            _heroStat('${d['min_hr'] ?? '—'}', 'min bpm'),
+            _heroStat('${d['calories'] ?? 0}', 'kcal'),
+          ]),
+        ]),
+      ),
+
+      // ── HEART RATE ──
       if (hr.length > 1) ...[
-        const SizedBox(height: Sp.x3),
-        ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x4), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const SizedBox(height: Sp.x4),
+        ProCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('Heart rate', style: AppText.label),
-          const SizedBox(height: Sp.x2),
-          AreaSpark(hr, color: AppColors.coral, height: 100),
-        ]))),
-      ],
-      if (z != null) ...[
-        const SizedBox(height: Sp.x3),
-        ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x4), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('HR zones', style: AppText.label),
           const SizedBox(height: Sp.x3),
-          SegmentBar([
-            (z['zone1_min'] as num?)?.toDouble() ?? 0, (z['zone2_min'] as num?)?.toDouble() ?? 0,
-            (z['zone3_min'] as num?)?.toDouble() ?? 0, (z['zone4_min'] as num?)?.toDouble() ?? 0,
-            (z['zone5_min'] as num?)?.toDouble() ?? 0,
-          ], const [AppColors.cool, AppColors.loadDetraining, AppColors.good, AppColors.warn, AppColors.coral], height: 14),
-        ]))),
+          AreaSpark(hr, color: AppColors.coral, height: 110),
+          if (drift != null || ttp != null) ...[
+            const SizedBox(height: Sp.x4),
+            const Divider(height: 1, color: AppColors.divider),
+            const SizedBox(height: Sp.x2),
+            if (ttp != null)
+              DetailRow(label: 'Time to peak HR', value: '${ttp.toInt()} min'),
+            if (drift != null)
+              DetailRow(
+                label: 'Cardiac drift',
+                value: '${drift > 0 ? '+' : ''}${drift.toStringAsFixed(1)}%',
+                trailing: AppIcon(drift > 3 ? Ic.up : Ic.down, size: 15,
+                    color: drift > 3 ? AppColors.warn : AppColors.good),
+              ),
+          ],
+        ])),
       ],
-      if (d['hrr60'] != null) ...[
-        const SizedBox(height: Sp.x3),
-        ProCard(child: Padding(padding: const EdgeInsets.all(Sp.x2), child: DetailRow(label: 'HR recovery (60s)', value: '${d['hrr60']} bpm'))),
+
+      // ── ZONES (bar + legend with bpm ranges + %) ──
+      if (bands.isNotEmpty && bands.any((b) => (b['min'] as num? ?? 0) > 0)) ...[
+        const SizedBox(height: Sp.x4),
+        ProCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Time in heart-rate zones', style: AppText.label),
+          const SizedBox(height: Sp.x3),
+          SegmentBar([for (final b in bands) (b['min'] as num?)?.toDouble() ?? 0], _zoneColors, height: 16),
+          const SizedBox(height: Sp.x4),
+          for (int i = 0; i < bands.length; i++) ...[
+            if (i > 0) const SizedBox(height: Sp.x3),
+            Row(children: [
+              Container(width: 10, height: 10, decoration: BoxDecoration(
+                color: _zoneColors[i], borderRadius: BorderRadius.circular(3))),
+              const SizedBox(width: Sp.x3),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Z${bands[i]['zone']} · ${bands[i]['name']}', style: AppText.body),
+                Text('${bands[i]['lo']}–${bands[i]['hi']} bpm', style: AppText.captionMuted),
+              ])),
+              Text('${(bands[i]['min'] as num?)?.round() ?? 0}m', style: AppText.label),
+              const SizedBox(width: Sp.x3),
+              SizedBox(width: 38, child: Text('${bands[i]['pct'] ?? 0}%',
+                  textAlign: TextAlign.right, style: AppText.captionMuted)),
+            ]),
+          ],
+        ])),
+      ],
+
+      // ── RECOVERY CURVE ──
+      if (curve.isNotEmpty) ...[
+        const SizedBox(height: Sp.x4),
+        ProCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Heart-rate recovery', style: AppText.label),
+          const SizedBox(height: Sp.x1),
+          Text('How fast your heart rate dropped after the effort — faster is fitter.',
+              style: AppText.captionMuted),
+          const SizedBox(height: Sp.x4),
+          Row(children: [
+            for (final c in curve)
+              _heroStat('−${(c['drop'] as num?)?.round() ?? 0}', '${((c['sec'] as num?)?.toInt() ?? 0) ~/ 60} min'),
+          ]),
+        ])),
+      ] else if (d['hrr60'] != null) ...[
+        const SizedBox(height: Sp.x4),
+        ProCard(child: DetailRow(label: 'HR recovery (60s)', value: '−${d['hrr60']} bpm')),
+      ],
+
+      // ── OUTPUT ──
+      if (_hasOutput(d)) ...[
+        const SizedBox(height: Sp.x4),
+        ProCard(child: Column(children: [
+          if (d['steps'] != null && (d['steps'] as num) > 0)
+            DetailRow(label: 'Steps', value: '${d['steps']}'),
+          if (d['cadence_spm'] != null)
+            DetailRow(label: 'Cadence', value: '${d['cadence_spm']} spm'),
+          DetailRow(label: 'Active calories', value: '${d['calories'] ?? 0} kcal'),
+          if (d['coverage_pct'] != null)
+            DetailRow(label: 'Wrist coverage', value: '${d['coverage_pct']}%'),
+        ])),
       ],
     ]);
   }
+
+  bool _hasOutput(Map<String, dynamic> d) =>
+      (d['steps'] != null && (d['steps'] as num) > 0) || d['cadence_spm'] != null ||
+      d['coverage_pct'] != null || d['calories'] != null;
+
+  Widget _heroStat(String v, String label) => Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    Text(v, style: AppText.metricSm.copyWith(fontSize: 18)),
+    Text(label, style: AppText.captionMuted),
+  ]));
 }
