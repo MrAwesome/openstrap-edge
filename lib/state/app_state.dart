@@ -11,6 +11,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -19,6 +20,8 @@ import '../models/app_status.dart';
 import '../ble/ble_engine.dart';
 import '../ble/ios_ble_restore.dart';
 import '../data/db.dart';
+import '../gestures/gesture_settings.dart';
+import '../gestures/gesture_dispatcher.dart';
 import '../data/models.dart';
 import '../net/api_client.dart';
 import '../live/live_activity.dart';
@@ -39,6 +42,10 @@ class AppState extends ChangeNotifier {
 
   DeviceState get device => engine.state;
   final DeviceAlerts _deviceAlerts = DeviceAlerts();
+
+  /// Band-gesture → action mapping (double-tap, etc.). Exposed for the settings UI.
+  final GestureSettings gestureSettings = GestureSettings();
+  late final GestureDispatcher _gestureDispatcher;
   Sample? lastSynced;
   Map<String, int> dbCounts = {'raw': 0, 'pending': 0};
   final List<String> logLines = [];
@@ -131,14 +138,28 @@ class AppState extends ChangeNotifier {
   }
 
   AppState() {
+    _gestureDispatcher = GestureDispatcher(
+      settings: gestureSettings,
+      log: _log,
+      onMarkMoment: _markMomentFromGesture,
+      onWorkoutToggle: _toggleWorkoutFromGesture,
+    );
     engine = BleEngine(
       onRecord: _onRecord,
       onState: _onEngineState,
       log: _log,
-      onEvent: (id, ts, hex) => LocalDb.insertEvent(id, ts, hex),
+      onEvent: _onLiveEvent,
       onRecordsBatch: LocalDb.insertRecordsBatch,
     );
     _init();
+  }
+
+  // Live (foreground / kept-alive) event path: persist every event, then let the
+  // gesture dispatcher act on it. Headless drain (background_sync) persists only —
+  // it must never replay an old tap as a live action.
+  void _onLiveEvent(int id, int ts, String hex) {
+    LocalDb.insertEvent(id, ts, hex);
+    _gestureDispatcher.onEvent(id, ts, hex);
   }
 
   Future<void> _init() async {
@@ -149,6 +170,9 @@ class AppState extends ChangeNotifier {
     lastSynced = await LocalDb.latestSample();
     dbCounts = await LocalDb.counts();
     _savedAlarm = (await SharedPreferences.getInstance()).getInt('alarm_epoch');
+    // Band-gesture mapping: load the saved action + query native capabilities so the
+    // settings UI knows what this platform supports. Best-effort, non-blocking.
+    unawaited(gestureSettings.bootstrap());
     initialized = true;
     notifyListeners();
     // App status (OTA pointer + admin alert banner) — best-effort, non-blocking.
@@ -602,6 +626,71 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     _log('Live session ended. Burned $finalKcal kcal.');
     LiveActivity.end();
+  }
+
+  // ── band-gesture actions (in-app) ─────────────────────────────────────────────
+  // Driven by the double-tap dispatcher (lib/gestures). Native actions (media, torch,
+  // ring) go over the platform channel; these two act on our own app/backend, so they
+  // work on every platform — and a haptic confirms the tap registered.
+
+  /// Double-tap → start a workout if none is live, else end the active one. Mirrors
+  /// the UI start/stop flow (api session + local live engine), minus the type picker
+  /// (defaults to 'other'; the user can refine it in the app).
+  Future<void> _toggleWorkoutFromGesture() async {
+    try {
+      if (activeWorkout != null) {
+        final id = activeWorkout!.workoutId;
+        stopWorkout();
+        if (id != null) {
+          try {
+            await api?.endWorkout(id);
+          } catch (_) {/* local already stopped; backend trues up on next sync */}
+        }
+      } else {
+        if (api == null) return;
+        String? id;
+        try {
+          final w = await api!.startWorkout('other');
+          id = w['workout_id'] as String?;
+        } catch (_) {/* still start locally so the user gets the live session */}
+        startWorkout(workoutId: id, type: 'other');
+      }
+      await HapticFeedback.mediumImpact();
+    } catch (e) {
+      _log('[gesture] workout toggle failed: $e');
+    }
+  }
+
+  /// Double-tap → stamp a timestamped tag onto today's journal (read-modify-write so
+  /// existing tags/note survive). "Remember this" for a spike, a set, a feeling.
+  Future<void> _markMomentFromGesture() async {
+    final a = api;
+    if (a == null) return;
+    try {
+      final now = DateTime.now();
+      final date = '${now.year.toString().padLeft(4, '0')}-'
+          '${now.month.toString().padLeft(2, '0')}-'
+          '${now.day.toString().padLeft(2, '0')}';
+      final hhmm = '${now.hour.toString().padLeft(2, '0')}:'
+          '${now.minute.toString().padLeft(2, '0')}';
+      List<String> tags = [];
+      String note = '';
+      try {
+        final journal = await a.getJournal(range: '7d');
+        final today = journal.firstWhere(
+          (r) => r['date'] == date,
+          orElse: () => <String, dynamic>{},
+        );
+        tags = (today['tags'] as List?)?.map((e) => e.toString()).toList() ?? [];
+        note = (today['note'] as String?) ?? '';
+      } catch (_) {/* fresh day / offline — start clean */}
+      tags.add('moment $hhmm');
+      await a.postJournal(date, tags, note);
+      _log('[gesture] moment marked at $hhmm');
+      await HapticFeedback.mediumImpact();
+    } catch (e) {
+      _log('[gesture] mark moment failed: $e');
+    }
   }
 
   void _tickWorkout() {

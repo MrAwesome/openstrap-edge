@@ -231,6 +231,11 @@ EventInfo? parseEvent(Uint8List inner) {
     case EventId.batteryPackRemoved:
       dec['pack_connected'] = eid == EventId.batteryPackConnected;
       break;
+    case EventId.doubleTap:
+      // Surfaced so the live event path can map it to a user action (see
+      // gestures/gesture_dispatcher.dart). Payload beyond the id is unused today.
+      dec['double_tap'] = true;
+      break;
   }
   return EventInfo(eid, name, ts, dec);
 }

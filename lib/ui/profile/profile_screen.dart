@@ -10,6 +10,7 @@ import '../../theme/theme_switcher.dart';
 import '../../theme/tokens.dart';
 import '../kit/kit.dart';
 import '../today/step_goal_screen.dart';
+import 'gesture_section.dart';
 
 class ProfileScreen extends StatelessWidget {
   const ProfileScreen({super.key});
@@ -128,6 +129,12 @@ class ProfileScreen extends StatelessWidget {
           ProCard(
             child: const AppearanceSelector(labeled: true),
           ),
+
+          const SizedBox(height: Sp.x7),
+
+          // ── Gestures ─────────────────────────────────────────────────
+          const SectionHeader('Gestures'),
+          const GestureSettingsCard(),
 
           const SizedBox(height: Sp.x7),
 
