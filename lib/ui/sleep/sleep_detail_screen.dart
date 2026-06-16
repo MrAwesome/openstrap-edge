@@ -291,9 +291,9 @@ class _SleepDetailScreenState extends State<SleepDetailScreen> {
           TrendMetricRow(icon: Ic.pulse, accent: AppColors.coralSoft, label: 'REM sleep',
               info: infoFor('rem'), value: _hm(_remMin), metric: 'rem', trendTitle: 'REM sleep'),
         if (_regularity != null)
-          TrendMetricRow(icon: Ic.calendar, accent: AppColors.good, label: 'Regularity (SRI)',
+          TrendMetricRow(icon: Ic.calendar, accent: AppColors.good, label: 'Consistency',
               info: infoFor('regularity'), value: '${_regularity!.round()}', metric: 'regularity',
-              trendTitle: 'Sleep regularity (SRI)'),
+              trendTitle: 'Sleep consistency'),
       ]),
     ];
   }

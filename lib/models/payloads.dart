@@ -338,7 +338,8 @@ class SleepData {
   Metric get needMin => metricOf(_row, 'need_min', flags: _flags);
   Metric get efficiency =>
       Metric.parse(_num(_row['efficiency']), flag: flagFor(_flags, 'duration'));
-  // Sleep regularity (SRI 0–100); backend column is `regularity` (bare number).
+  // Sleep-timing consistency 0–100 (circular variance of bed/wake times — not the
+  // Phillips epoch-agreement SRI); backend column is `regularity` (bare number).
   Metric get regularity => metricOf(_row, 'regularity', flags: _flags);
   Metric get lightMin => metricOf(_row, 'light_min', flags: _flags);
   Metric get deepMin => metricOf(_row, 'deep_min', flags: _flags);
