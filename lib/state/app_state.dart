@@ -489,11 +489,13 @@ class AppState extends ChangeNotifier {
     try {
       // Keep trying for as long as we still want the link (a session is active) —
       // a runner who left their phone behind can be out of range for an hour.
-      // Capped exponential backoff so we don't hammer the radio.
+      // Bounded exponential backoff + jitter, owned by the transport's
+      // ReconnectPolicy. The engine's single in-flight guard guarantees this loop
+      // can never overlap a foreground connect on the same band.
       int attempt = 0;
       while (_keepAlive && !engine.isConnected) {
         attempt++;
-        await Future.delayed(Duration(seconds: (2 * attempt).clamp(2, 30)));
+        await Future.delayed(engine.reconnectDelay(attempt));
         if (!_keepAlive) break;
         if (await engine.connectToRemoteId(paired!.remoteId)) {
           // Reclaim the band from the iOS restore central so it stops competing.

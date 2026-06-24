@@ -1,16 +1,32 @@
-// BLE engine — the BLE client for the WHOOP 4.0 band, on flutter_blue_plus.
+// BLE engine — the WHOOP 4.0 (Harvard) BLE transport, on flutter_blue_plus.
 //
-// Responsibilities: service-filtered scan, connect, subscribe to the three notify
-// characteristics (each with its OWN length-based reassembler), the 5-packet INIT,
-// the historical-sync drain with the correct 3-state ACK, live-stream enable/disable,
-// heartbeat + battery poll, and a graceful, SAFE shutdown.
+// REWRITTEN TRANSPORT (feat/ble-rewrite). The protocol/byte layer is unchanged:
+// everything still goes through `package:openstrap_protocol` (framing/CRC, INIT,
+// buildCommand, buildBatchAck, parseMetadata, decodeRecord/parseR24, constants,
+// dangerousCmds). What changed is HOW we manage the link:
 //
-// SAFETY (): we NEVER send FORCE_TRIM (0x19), REBOOT (0x1D), or
-// TOGGLE_PERSISTENT_R21 (0x9A). Optical is wrist-gated (0x6B only). The drain is
-// non-destructive — the cursor advances on ACK and persists across connections.
+//   * One explicit connection state machine (`ble_state.dart`); the
+//     flutter_blue_plus `connectionState` stream is the SOURCE OF TRUTH for
+//     connected/disconnected — we never set "connected" by hand.
+//   * A single in-flight guard (`_opLock`) so connect/reconnect/disconnect can
+//     NEVER overlap (the classic flaky-connect bug).
+//   * A per-connection `_Session` that owns the device, characteristics, the
+//     three reassemblers, EVERY stream subscription, and the heartbeat timer —
+//     torn down atomically on disconnect so nothing leaks across reconnects.
+//   * An event-driven drain controller that completes on HISTORY_COMPLETE,
+//     live-edge, idle, timeout, OR link-drop (no busy-poll that ignores drops).
 //
-// SEQ DISCIPLINE: live commands use a HIGH counter (0xA0+); sync ACKs use a LOW
-// counter (5+, continuing from INIT 0..4). The two never collide.
+// SAFETY: we NEVER send a dangerousCmd (FORCE_TRIM 0x19 / REBOOT 0x1D /
+// TOGGLE_PERSISTENT_R21 0x9A). Optical is wrist-gated (0x6B only).
+//
+// SEQ DISCIPLINE: live commands use the HIGH range (0xA0+); sync ACKs use the LOW
+// range (5+, continuing from INIT 0..4). Allocated by `SeqAllocator` so they
+// never collide.
+//
+// PUBLIC SURFACE is identical to the old engine — AppState / background_sync /
+// edge_tracking compile unchanged. The drain-completion signal the
+// DerivationEngine depends on (runSync() returning SyncReport after the final
+// flush) is preserved.
 
 import 'dart:async';
 import 'dart:io';
@@ -19,10 +35,10 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:openstrap_protocol/openstrap_protocol.dart';
 
 import '../data/models.dart';
+import 'ble_state.dart';
 
-// Little-endian u32 reader. The package keeps `u32` private (it isn't on the
-// public barrel), and the engine only needs it to peek the record-counter / ts
-// out of a raw historical frame header — so we inline the one-liner here.
+// Little-endian u32 reader. The package keeps `u32` private, and the engine only
+// needs it to peek the record-counter / ts out of a raw historical frame header.
 int u32(Uint8List b, int o) =>
     b.buffer.asByteData(b.offsetInBytes, b.length).getUint32(o, Endian.little);
 
@@ -40,6 +56,36 @@ class SyncReport {
   SyncReport(this.records, this.batches, this.complete);
 }
 
+/// All per-connection resources. A fresh one is built on every connect and torn
+/// down (every subscription + timer cancelled, characteristics nulled) on every
+/// disconnect — so NOTHING bleeds across reconnects (the old engine's #1 leak).
+class _Session {
+  final BluetoothDevice device;
+  BluetoothCharacteristic? cmdTo;
+  final Map<String, FrameReassembler> asm = {
+    'cmd_from': FrameReassembler(),
+    'events': FrameReassembler(),
+    'data': FrameReassembler(),
+  };
+  final List<StreamSubscription> subs = [];
+  Timer? heartbeat;
+  bool connected = true; // false the moment the connectionState stream says so
+  bool intentionalClose = false;
+
+  _Session(this.device);
+
+  Future<void> teardown() async {
+    heartbeat?.cancel();
+    heartbeat = null;
+    for (final s in subs) {
+      await s.cancel();
+    }
+    subs.clear();
+    cmdTo = null;
+    connected = false;
+  }
+}
+
 class BleEngine {
   final SampleSink onRecord;
   final StateSink onState;
@@ -48,86 +94,104 @@ class BleEngine {
 
   /// If provided, historical-drain records are buffered and flushed in batches
   /// (one DB transaction per ACK boundary) instead of one-by-one via [onRecord].
-  /// Much faster on large drains. Live records still go through [onRecord].
   final BatchSink? onRecordsBatch;
 
-  BleEngine(
-      {required this.onRecord,
-      required this.onState,
-      this.log,
-      this.onEvent,
-      this.onRecordsBatch});
-
-  // Drain buffer (historical 0x2F records), flushed before each sync ACK.
-  final List<RawRecord> _drainRaws = [];
-  final List<Sample?> _drainSamples = [];
+  BleEngine({
+    required this.onRecord,
+    required this.onState,
+    this.log,
+    this.onEvent,
+    this.onRecordsBatch,
+  });
 
   final DeviceState state = DeviceState();
 
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _cmdTo;
-  final _asm = {
-    'cmd_from': FrameReassembler(),
-    'events': FrameReassembler(),
-    'data': FrameReassembler(),
-  };
-  final List<StreamSubscription> _subs = [];
+  // ── transport state machine ─────────────────────────────────────────────────
+  BleConnState _phase = BleConnState.idle;
+  _Session? _session;
 
-  int _cmdSeq = 0xA0; // live commands (high range)
-  int _syncSeq = 5; // batch ACKs (continue from INIT 0..4)
+  // Single in-flight guard. Every connect/disconnect/reconnect serialises through
+  // this so two attempts can never race on the same peripheral.
+  Future<void> _opLock = Future.value();
+
+  final SeqAllocator _seq = SeqAllocator();
   Future<void> _writeChain = Future.value();
 
-  bool _syncComplete = false;
-  int _syncRecords = 0;
-  int _syncBatches = 0;
-  int _firstTs = 0; // first historical record ts this session
-  int _lastTs = 0; // last historical record ts this session
-  bool _liveEnabled = false;
-  Timer? _heartbeat;
+  /// Reconnection backoff schedule (bounded exponential + jitter). Owned by the
+  /// transport; the caller's reconnect loop reads `reconnectDelay(attempt)` so the
+  /// schedule lives in one place. Exposed so it's testable + tunable.
+  final ReconnectPolicy reconnectPolicy = ReconnectPolicy();
 
-  // Wall-clock of the last BLE notification received on ANY characteristic. iOS can
-  // resume the app with the peripheral still flagged "connected" while its GATT
-  // notifications silently died during suspension (they don't auto-resume) — the UI
-  // reads connected but no events ever arrive. The foreground-reclaim path consults this
-  // to tell a genuinely live link (recent data) from a stale one (force a reconnect).
+  /// The delay to wait before reconnect `attempt` (1-based). Bounded + jittered.
+  Duration reconnectDelay(int attempt) => reconnectPolicy.delayFor(attempt);
+
+  // Drain bookkeeping (only valid while syncing).
+  _DrainController? _drain;
+  bool _liveEnabled = false;
+
+  // Wall-clock of the last BLE notification received on ANY characteristic. iOS
+  // can resume the app with the peripheral still flagged "connected" while its
+  // GATT notifications silently died during suspension — the UI reads connected
+  // but no events arrive. The foreground-reclaim path consults this to tell a
+  // genuinely live link (recent data) from a stale one.
   DateTime _lastRx = DateTime.fromMillisecondsSinceEpoch(0);
   Duration get sinceLastRx => DateTime.now().difference(_lastRx);
 
-  void _setConn(String c) {
-    state.connection = c;
+  void _log(String s) => log?.call(s);
+
+  void _setPhase(BleConnState p) {
+    _phase = p;
+    state.connection = connStringFor(p);
     onState(state);
   }
 
-  void _log(String s) => log?.call(s);
+  bool get isConnected =>
+      _session?.connected == true &&
+      (_phase == BleConnState.ready ||
+          _phase == BleConnState.live ||
+          _phase == BleConnState.syncing);
 
-  // ── scan ───────────────────────────────────────────────────────────────────
+  /// Run [body] under the single in-flight guard. Chains onto the existing op so
+  /// callers can never start two transport operations concurrently.
+  Future<T> _locked<T>(Future<T> Function() body) {
+    final completer = Completer<T>();
+    _opLock = _opLock.then((_) async {
+      try {
+        completer.complete(await body());
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
+  }
+
+  // ── scan ─────────────────────────────────────────────────────────────────────
   /// Service-filtered scan (mandatory on iOS/macOS — passive scans hide the UUID).
-  /// Canonical flutter_blue_plus pattern: start ONE scan, let the timeout stop it,
-  /// stop early when we find a match. NEVER rapid start/stop (Android throttles →
-  /// SCANNING_TOO_FREQUENTLY / status=6).
-  Future<BluetoothDevice?> scan({Duration timeout = const Duration(seconds: 12)}) async {
+  /// Start ONE scan, stop early on a match, otherwise let the timeout stop it.
+  /// NEVER rapid start/stop (Android throttles → SCANNING_TOO_FREQUENTLY).
+  Future<BluetoothDevice?> scan(
+      {Duration timeout = const Duration(seconds: 12)}) async {
     if (FlutterBluePlus.isScanningNow) {
       await FlutterBluePlus.stopScan();
     }
-    _setConn('scanning');
+    _setPhase(BleConnState.scanning);
     final svc = Guid(GattUuids.service);
     BluetoothDevice? found;
     final sub = FlutterBluePlus.onScanResults.listen((results) {
       for (final r in results) {
         final name = r.device.platformName.toLowerCase();
-        final advNames = r.advertisementData.serviceUuids.map((g) => g.str.toLowerCase());
+        final advNames =
+            r.advertisementData.serviceUuids.map((g) => g.str.toLowerCase());
         if (found == null &&
             (name.contains('whoop') ||
                 advNames.any((s) => s.startsWith('61080001')))) {
           found = r.device;
-          FlutterBluePlus.stopScan(); // end early — the loop below will exit
+          FlutterBluePlus.stopScan();
         }
       }
     });
     try {
       await FlutterBluePlus.startScan(withServices: [svc], timeout: timeout);
-      // startScan returns once started; wait until scanning actually stops
-      // (either our early stopScan above, or the timeout).
       await FlutterBluePlus.isScanning.where((on) => on == false).first;
     } catch (e) {
       _log('scan error: $e');
@@ -135,7 +199,7 @@ class BleEngine {
       await sub.cancel();
     }
     if (found == null) {
-      _setConn('disconnected');
+      _setPhase(BleConnState.idle);
       _log('No WHOOP found (force-quit the official app; band must be free).');
     }
     return found;
@@ -145,26 +209,53 @@ class BleEngine {
   Future<bool> connectToRemoteId(String remoteId) =>
       connect(BluetoothDevice.fromId(remoteId));
 
-  bool get isConnected => state.connection == 'connected' || state.connection == 'syncing';
+  // ── connect ────────────────────────────────────────────────────────────────────
+  /// Idempotent connect. Serialised through [_opLock] so it can never overlap
+  /// another connect/disconnect. Returns true on a fully-ready link.
+  Future<bool> connect(BluetoothDevice device) => _locked(() async {
+        // Already connected to this exact peripheral and ready → no-op success.
+        if (_session != null &&
+            _session!.connected &&
+            _session!.device.remoteId == device.remoteId &&
+            (_phase == BleConnState.ready ||
+                _phase == BleConnState.live ||
+                _phase == BleConnState.syncing)) {
+          _log('connect: already connected to ${device.remoteId.str} — reusing.');
+          return true;
+        }
+        // Any prior session is dead to us now — tear it down before a new one.
+        await _teardownSession(intentional: true);
+        return _doConnect(device);
+      });
 
-  // ── connect ──────────────────────────────────────────────────────────────────
-  Future<bool> connect(BluetoothDevice device) async {
-    _device = device;
+  Future<bool> _doConnect(BluetoothDevice device) async {
     state.address = device.remoteId.str;
-    _setConn('connecting');
-    for (final a in _asm.values) {
-      a.reset();
-    }
+    _setPhase(BleConnState.connecting);
+    final session = _Session(device);
+    _session = session;
+    _seq.reset();
+
+    // SOURCE OF TRUTH: listen to the OS connection-state stream FIRST so we never
+    // miss the disconnect that can fire during discovery/subscribe.
+    session.subs.add(device.connectionState.listen((s) {
+      if (s == BluetoothConnectionState.disconnected) {
+        _onLinkDown(session);
+      }
+    }));
+
     try {
-      await device.connect(timeout: const Duration(seconds: 20), autoConnect: false);
+      await device.connect(
+          timeout: const Duration(seconds: 20), autoConnect: false);
     } catch (e) {
       _log('connect failed: $e');
-      _setConn('disconnected');
+      await _teardownSession(intentional: true);
+      _setPhase(BleConnState.idle);
       return false;
     }
-    // Bond. On Android we must explicitly createBond (the strap gates commands
-    // behind encryption — without a bond the ACK/commands are silently dropped).
-    // On iOS, bonding happens implicitly on the first write-with-response.
+
+    // Bond. On Android we explicitly createBond (the strap gates commands behind
+    // encryption — without a bond the ACK/commands are silently dropped). On iOS
+    // bonding happens implicitly on the first write-with-response.
     if (Platform.isAndroid) {
       try {
         await device.createBond();
@@ -174,14 +265,11 @@ class BleEngine {
       }
     }
 
-    // Request a larger MTU on Android (no-op on iOS).
+    // Larger MTU + a fast connection interval for the drain (Android-only levers;
+    // no-ops on iOS, which picks a fast interval itself when data is pending).
     try {
       await device.requestMtu(247);
     } catch (_) {}
-
-    // Ask Android for a fast connection interval during the drain — this is the
-    // biggest BLE throughput lever (2–4× on bulk transfer). Android-only; iOS picks
-    // a fast interval on its own when there's pending data.
     if (Platform.isAndroid) {
       try {
         await device.requestConnectionPriority(
@@ -189,6 +277,12 @@ class BleEngine {
       } catch (_) {}
     }
 
+    if (!session.connected) {
+      _log('connect: link dropped during setup.');
+      return false;
+    }
+
+    _setPhase(BleConnState.discovering);
     final services = await device.discoverServices();
     BluetoothService? svc;
     for (final s in services) {
@@ -196,7 +290,8 @@ class BleEngine {
     }
     if (svc == null) {
       _log('Harvard service not found on device.');
-      _setConn('disconnected');
+      await _teardownSession(intentional: true);
+      _setPhase(BleConnState.idle);
       return false;
     }
     BluetoothCharacteristic? find(String prefix) {
@@ -206,68 +301,90 @@ class BleEngine {
       return null;
     }
 
-    _cmdTo = find('61080002');
+    session.cmdTo = find('61080002');
     final cmdFrom = find('61080003');
     final events = find('61080004');
     final data = find('61080005');
-    if (_cmdTo == null || cmdFrom == null || events == null || data == null) {
+    if (session.cmdTo == null ||
+        cmdFrom == null ||
+        events == null ||
+        data == null) {
       _log('Missing one or more Harvard characteristics.');
-      _setConn('disconnected');
+      await _teardownSession(intentional: true);
+      _setPhase(BleConnState.idle);
       return false;
     }
-    await _subscribe(cmdFrom, 'cmd_from');
-    await _subscribe(events, 'events');
-    await _subscribe(data, 'data');
 
-    _subs.add(device.connectionState.listen((s) {
-      if (s == BluetoothConnectionState.disconnected) {
-        _setConn('disconnected');
-      }
-    }));
+    _setPhase(BleConnState.subscribing);
+    await _subscribe(session, cmdFrom, 'cmd_from');
+    await _subscribe(session, events, 'events');
+    await _subscribe(session, data, 'data');
 
-    // Set the strap's RTC to real wall-clock time. The band ships with an unset
-    // clock (drifts to bogus dates), so every record/event would otherwise carry
-    // a garbage timestamp. SET_CLOCK is non-destructive (it's what the official
-    // app does each connect); records stamped after this carry real unix time.
+    _setPhase(BleConnState.settingUp);
+    // Set the strap RTC to real wall-clock time. The band ships with an unset
+    // clock; SET_CLOCK is non-destructive (it's what the official app does each
+    // connect). Records stamped after this carry real unix time.
     await setClock();
 
-    // Heartbeat: the reference client sends LINK_VALID every ~10s to keep the link alive
-    // during the drain. Without it the band can behave oddly mid-sync.
-    _heartbeat?.cancel();
-    _heartbeat = Timer.periodic(const Duration(seconds: 10), (_) {
-      _send(Cmd.linkValid, const [0x00]);
+    // Heartbeat: keep the link alive (~10s LINK_VALID). Owned by the session, so a
+    // disconnect cancels it — no zombie timer firing into a dead characteristic.
+    session.heartbeat = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (session.connected) _send(Cmd.linkValid, const [0x00]);
     });
 
-    _lastRx = DateTime.now(); // fresh link — never treat as stale on an immediate resume
-    _setConn('connected');
+    _lastRx = DateTime.now(); // fresh link — never treat as stale on resume
+    _setPhase(BleConnState.ready);
     _log('Connected + subscribed.');
     return true;
   }
 
-  Future<void> _subscribe(BluetoothCharacteristic c, String role) async {
+  Future<void> _subscribe(
+      _Session session, BluetoothCharacteristic c, String role) async {
     await c.setNotifyValue(true);
-    _subs.add(c.onValueReceived.listen((chunk) {
-      _lastRx = DateTime.now(); // any notification = the link is genuinely delivering
-      for (final frame in _asm[role]!.feed(chunk)) {
+    session.subs.add(c.onValueReceived.listen((chunk) {
+      // Ignore notifications from a session we've already torn down.
+      if (_session != session || !session.connected) return;
+      _lastRx = DateTime.now();
+      for (final frame in session.asm[role]!.feed(chunk)) {
         if (frame.valid) _onFrame(role, frame);
       }
     }));
   }
 
-  // ── write (serialized) ───────────────────────────────────────────────────────
-  // CRITICAL: WHOOP's command characteristic is write-WITHOUT-response (the reference client
-  // writes with response=False). A write-with-response on a WoR-only characteristic
-  // never lands — which silently breaks the historical ACK and the band re-sends the
-  // same batch forever. So we prefer writeWithoutResponse whenever the char supports it.
+  // ── link-down handling (drives reconnect via the caller's contract) ─────────────
+  void _onLinkDown(_Session session) {
+    if (_session != session) return; // a stale session's stream
+    final wasIntentional = session.intentionalClose;
+    session.connected = false;
+    // A drain in flight must complete (with linkDown) immediately, not run out
+    // its full budget.
+    _drain?.onLinkDown();
+    // The caller (AppState) listens for the 'disconnected' phase to drive its
+    // reconnect loop; we surface it here. We do NOT auto-reconnect inside the
+    // engine — the caller owns reconnect intent (keepAlive), and routes it back
+    // through the same single-flight connect, so there's still exactly one path.
+    if (!wasIntentional) {
+      final reason = session.device.disconnectReason;
+      _log('Link down (reason=${reason?.description ?? "unknown"}).');
+    }
+    _setPhase(BleConnState.idle);
+  }
+
+  // ── write (serialised through a single chain) ───────────────────────────────────
+  // The cmd characteristic write is WITH-RESPONSE: that's what triggers BLE bonding
+  // (the auth challenge) AND gets commands delivered + acknowledged. Write-WITHOUT-
+  // response can't bond and is silently dropped — the bug that broke the whole sync.
   Future<void> _write(Uint8List raw) {
+    final session = _session;
     final completer = Completer<void>();
     _writeChain = _writeChain.then((_) async {
       try {
-        // WRITE-WITH-RESPONSE. Verified on real hardware (5.454.0): with-response
-        // is what triggers BLE bonding (the auth challenge) AND gets commands
-        // actually delivered + acknowledged. Write-WITHOUT-response can't bond and
-        // gets silently dropped — that was the bug that broke the whole sync.
-        await _cmdTo!.write(raw, withoutResponse: false);
+        final cmd = session?.cmdTo;
+        if (session == null || !session.connected || cmd == null) {
+          _log('write skipped: link not ready.');
+          return;
+        }
+        await cmd.write(raw, withoutResponse: false);
       } catch (e) {
         _log('write error: $e');
       } finally {
@@ -278,18 +395,15 @@ class BleEngine {
   }
 
   Future<void> _send(int opcode, List<int> payload) async {
-    // GUARD: never emit a dangerous opcode from the engine.
     if (dangerousCmds.contains(opcode)) {
       _log('REFUSED dangerous opcode 0x${opcode.toRadixString(16)}');
       return;
     }
-    final frame = buildCommand(_cmdSeq, opcode, payload);
-    _cmdSeq = (_cmdSeq + 1) & 0xFF;
-    if (_cmdSeq < 0xA0) _cmdSeq = 0xA0;
+    final frame = buildCommand(_seq.nextLive(), opcode, payload);
     await _write(frame);
   }
 
-  // ── frame handling ─────────────────────────────────────────────────────────
+  // ── frame handling ─────────────────────────────────────────────────────────────
   void _onFrame(String role, Frame frame) {
     final pt = frame.packetType;
     if (pt == PacketType.metadata) {
@@ -297,9 +411,8 @@ class BleEngine {
       return;
     }
     // LIVE streams: realtime HR/RR (0x28), realtime R10 (0x2B), IMU (0x33).
-    // Raw-first — store + queue for upload; the backend field-decodes. Never
-    // touch the historical-sync bookkeeping (_syncRecords/_lastTs) or the
-    // live-edge detection, which key off 0x2F only.
+    // Raw-first — store; the backend/on-device layer field-decodes. Never touch
+    // the historical-sync bookkeeping (which keys off 0x2F only).
     if (pt == PacketType.realtimeData ||
         pt == PacketType.realtimeRawData ||
         pt == PacketType.realtimeImuStream) {
@@ -309,12 +422,10 @@ class BleEngine {
         hex: _innerHex(frame.inner),
         capturedAt: DateTime.now().millisecondsSinceEpoch,
       );
-      onRecord(null, raw); // store raw only; no edge decode (dumb pipe)
-      // No early return here — allow fallthrough to decodeFrame and _absorbState
-      // so the UI gets live telemetry updates.
+      onRecord(null, raw);
+      // Fall through to decodeFrame so the UI gets live telemetry.
     }
     if (pt == PacketType.historicalData) {
-      _syncRecords++;
       final recType = frame.inner.length > 1 ? frame.inner[1] : -1;
       final counter = _counterFromInner(frame.inner);
       final raw = RawRecord(
@@ -323,43 +434,31 @@ class BleEngine {
         hex: _innerHex(frame.inner),
         capturedAt: DateTime.now().millisecondsSinceEpoch,
       );
-      // Track timestamp span of this drain (to see if the cursor persists/advances
-      // across syncs). Read ts from the generic header [7:11].
+      int ts = 0;
       if (frame.inner.length >= 11) {
-        final ts = u32(frame.inner, 7);
-        if (ts > 1000000000) {
-          if (_firstTs == 0) _firstTs = ts;
-          _lastTs = ts;
-        }
+        final t = u32(frame.inner, 7);
+        if (t > 1000000000) ts = t;
       }
       Sample? sample;
       if (recType == Record.r24) {
         final r = parseR24(frame.inner);
         if (r != null) {
-          sample = Sample(
-            tsEpoch: r.tsEpoch,
-            counter: r.counter,
-            hr: r.hr,
-          );
+          sample = Sample(tsEpoch: r.tsEpoch, counter: r.counter, hr: r.hr);
         }
       } else if (recType == Record.r10) {
-        // Historical R10: HR + real unix ts (no spo2/temp/rhr in this record).
         final r = parseR10Lite(frame.inner);
         if (r != null) {
-          sample = Sample(
-            tsEpoch: r.tsEpoch,
-            counter: r.counter,
-            hr: r.hr,
-          );
+          sample = Sample(tsEpoch: r.tsEpoch, counter: r.counter, hr: r.hr);
         }
       }
-      // Background sync: store ONLY. Never touch the live display — the screen
-      // shows genuine live-stream data (0x2B/0x28), not historical drain values.
-      // Buffer for a batched DB flush (flushed before each ACK) when available;
-      // otherwise fall back to per-record insert.
-      if (onRecordsBatch != null) {
-        _drainRaws.add(raw);
-        _drainSamples.add(sample);
+      // Hand the record to the drain controller (it buffers + tracks ts/counts),
+      // or store directly if no drain is active (shouldn't happen for 0x2F, but
+      // safe).
+      final d = _drain;
+      if (d != null) {
+        d.onHistoricalRecord(raw, sample, ts);
+      } else if (onRecordsBatch != null) {
+        unawaited(onRecordsBatch!([raw], [sample]));
       } else {
         onRecord(sample, raw);
       }
@@ -370,7 +469,6 @@ class BleEngine {
           'inner=${_innerHex(frame.inner)}');
     } else if (pt == PacketType.event) {
       _log('[EVENT] ${_innerHex(frame.inner)}');
-      // Persist every event (live or from sync) so nothing is lost if upload fails.
       final e = parseEvent(frame.inner);
       if (e != null) onEvent?.call(e.eventId, e.tsEpoch, _innerHex(frame.inner));
     }
@@ -382,7 +480,6 @@ class BleEngine {
     final f = d.fields;
     if (f.containsKey('alarm_epoch')) {
       final e = f['alarm_epoch'] as int;
-      // Only trust plausible future-ish epochs (the GET format is best-effort).
       state.alarmEpoch = e > 1000000000 ? e : null;
       onState(state);
     }
@@ -420,47 +517,33 @@ class BleEngine {
     }
   }
 
-  /// Persist buffered drain records in one transaction. Snapshots the buffer so
-  /// records arriving during the await land in the next batch, not this one.
-  Future<void> _flushDrain() async {
-    if (onRecordsBatch == null || _drainRaws.isEmpty) return;
-    final raws = List<RawRecord>.from(_drainRaws);
-    final samples = List<Sample?>.from(_drainSamples);
-    _drainRaws.clear();
-    _drainSamples.clear();
-    try {
-      await onRecordsBatch!(raws, samples);
-    } catch (e) {
-      _log('drain flush error: $e');
-    }
-  }
-
   Future<void> _handleSyncMarker(Frame frame) async {
     final m = parseMetadata(frame.inner);
     if (m == null) return;
-    // Dump the FULL raw metadata frame so we can read the real token layout off
-    // the device (5.454.0 builds the ACK from parsed ranges, not a flat slice).
     _log('[SYNC] META sub=${m.sub} inner='
         '${frame.inner.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
-    if (m.sub == SyncMeta.historyStart) return; // informational
+    if (m.sub == SyncMeta.historyStart) return;
     if (m.sub == SyncMeta.historyEnd && m.token != null) {
-      _syncBatches++;
+      final d = _drain;
+      if (d == null) return;
       final tokenHex =
           m.token!.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-      _log('[SYNC] HistoryEnd batch=${m.batchId} records=$_syncRecords '
-          '→ ACK seq=$_syncSeq token=$tokenHex');
-      // Raw-first: persist this batch's records BEFORE we ACK (the band's cursor
-      // advances on ACK, so anything unflushed at ACK time could be lost).
-      await _flushDrain();
-      // ACK and KEEP listening. THIS is the fragile path ().
-      final ack = buildBatchAck(_syncSeq, m.token!);
-      _log('[SYNC] ACK frame=${ack.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
-      _syncSeq = (_syncSeq + 1) & 0xFF;
-      _write(ack);
+      _log('[SYNC] HistoryEnd batch=${m.batchId} records=${d.records} '
+          'token=$tokenHex');
+      // RAW-FIRST: persist this batch BEFORE we ACK (the band's cursor advances
+      // on ACK, so anything unflushed at ACK time could be lost).
+      await d.flush();
+      final ack = buildBatchAck(_seq.nextSync(), m.token!);
+      _log('[SYNC] ACK frame='
+          '${ack.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
+      d.noteBatchAcked();
+      await _write(ack); // ACK and KEEP listening
     } else if (m.sub == SyncMeta.historyComplete) {
-      await _flushDrain();
-      _log('[SYNC] HistoryComplete — drained $_syncRecords records. Done.');
-      _syncComplete = true;
+      final d = _drain;
+      if (d == null) return;
+      await d.flush();
+      _log('[SYNC] HistoryComplete — drained ${d.records} records. Done.');
+      d.onComplete();
     }
   }
 
@@ -469,7 +552,7 @@ class BleEngine {
   String _innerHex(Uint8List inner) =>
       inner.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
-  // ── high-level flows ─────────────────────────────────────────────────────────
+  // ── high-level flows ─────────────────────────────────────────────────────────────
   Future<void> sendInit() async {
     _log('Sending 5-packet INIT…');
     for (final pkt in initPackets) {
@@ -479,53 +562,48 @@ class BleEngine {
   }
 
   /// Full drain: INIT → receive records → ACK each batch → stop on COMPLETE,
-  /// idle, OR once we've caught up to the live edge (worn band tails 1 Hz forever).
-  Future<SyncReport> runSync({Duration timeout = const Duration(seconds: 600)}) async {
-    _syncComplete = false;
-    _syncRecords = 0;
-    _syncBatches = 0;
-    _firstTs = 0;
-    _lastTs = 0;
-    _setConn('syncing');
+  /// live-edge, idle, link-down, or timeout. Returns AFTER the final flush, so the
+  /// DerivationEngine's post-drain hook fires only once everything is persisted.
+  Future<SyncReport> runSync(
+      {Duration timeout = const Duration(seconds: 600)}) async {
+    final session = _session;
+    if (session == null || !session.connected) {
+      _log('runSync: no live link — nothing to drain.');
+      return SyncReport(0, 0, false);
+    }
+    final drain = _DrainController(
+      onRecord: onRecord,
+      onRecordsBatch: onRecordsBatch,
+      log: _log,
+      evaluator: DrainStopEvaluator(timeout: timeout),
+    );
+    _drain = drain;
+    _setPhase(BleConnState.syncing);
     await sendInit();
 
-    final start = DateTime.now();
-    int last = _syncRecords;
-    var idleSince = DateTime.now();
-    while (!_syncComplete && DateTime.now().difference(start) < timeout) {
-      await Future.delayed(const Duration(seconds: 1));
-      // Caught up to the live edge? A worn band keeps feeding 1 Hz forever, so
-      // "drained all backlog" = newest record is within ~15s of now. Stop there.
-      final nowS = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      if (_lastTs > 0 && (nowS - _lastTs) < 15 && _syncRecords > 0) {
-        _log('[SYNC] caught up to live edge (lastTs within 15s of now) — stopping drain.');
-        await _send(Cmd.abortHistoricalTransmits, const [0x00]);
-        break;
-      }
-      if (_syncRecords != last) {
-        last = _syncRecords;
-        idleSince = DateTime.now();
-      } else if (DateTime.now().difference(idleSince) > const Duration(seconds: 8)) {
-        _log('[SYNC] idle — sending ABORT_HISTORICAL to settle.');
-        await _send(Cmd.abortHistoricalTransmits, const [0x00]);
-        break;
-      }
+    final report = await drain.run(
+      isLinkUp: () => session.connected,
+      sendAbort: () => _send(Cmd.abortHistoricalTransmits, const [0x00]),
+    );
+
+    _drain = null;
+    // Restore phase based on what's still true (link may have dropped mid-drain).
+    if (session.connected) {
+      _setPhase(_liveEnabled ? BleConnState.live : BleConnState.ready);
     }
-    // Persist anything still buffered when we exit via live-edge/idle/timeout
-    // (those paths don't get a HistoryComplete marker).
-    await _flushDrain();
-    _setConn('connected');
-    _log('[SYNC] DRAIN SUMMARY: records=$_syncRecords batches=$_syncBatches '
-        'complete=$_syncComplete firstTs=$_firstTs lastTs=$_lastTs '
-        'span=${_lastTs - _firstTs}s');
-    return SyncReport(_syncRecords, _syncBatches, _syncComplete);
+    _log('[SYNC] DRAIN SUMMARY: records=${report.records} '
+        'batches=${report.batches} complete=${report.complete}');
+    return report;
   }
 
   /// Set the strap RTC to current unix time: payload = [u32 epoch LE, u32 pad].
   Future<void> setClock() async {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     await _send(Cmd.setClock, [
-      now & 0xff, (now >> 8) & 0xff, (now >> 16) & 0xff, (now >> 24) & 0xff,
+      now & 0xff,
+      (now >> 8) & 0xff,
+      (now >> 16) & 0xff,
+      (now >> 24) & 0xff,
       0, 0, 0, 0,
     ]);
     _log('SET_CLOCK → $now (strap RTC aligned to real time).');
@@ -536,7 +614,10 @@ class BleEngine {
   Future<void> setAlarm(int epoch) async {
     await _send(Cmd.setAlarmTime, [
       0x01,
-      epoch & 0xff, (epoch >> 8) & 0xff, (epoch >> 16) & 0xff, (epoch >> 24) & 0xff,
+      epoch & 0xff,
+      (epoch >> 8) & 0xff,
+      (epoch >> 16) & 0xff,
+      (epoch >> 24) & 0xff,
       0, 0,
     ]);
     _log('SET_ALARM_TIME → $epoch');
@@ -545,10 +626,10 @@ class BleEngine {
   Future<void> getAlarm() => _send(Cmd.getAlarmTime, const [revision1]);
   Future<void> disableAlarm() => _send(Cmd.disableAlarm, const [0x00]);
 
-  Future<void> getStrapName() => _send(Cmd.getAdvertisingNameHarvard, const [0x00]);
+  Future<void> getStrapName() =>
+      _send(Cmd.getAdvertisingNameHarvard, const [0x00]);
 
-  /// Rename the strap (advertising name). Payload:
-  /// [0x01][name length u8][ASCII name bytes][u32 0].
+  /// Rename the strap. Payload: [0x01][name length u8][ASCII name bytes][u32 0].
   Future<void> setStrapName(String name) async {
     final ascii = name.codeUnits.where((c) => c >= 0x20 && c < 0x7f).toList();
     final payload = <int>[0x01, ascii.length, ...ascii, 0, 0, 0, 0];
@@ -558,11 +639,13 @@ class BleEngine {
 
   Future<void> getBattery() => _send(Cmd.getBatteryLevel, const []);
   Future<void> getHello() => _send(Cmd.getHelloHarvard, const [0x00]);
-  Future<void> buzz() => _send(Cmd.runHapticsPattern, const [hapticShortPulse, 0, 0, 0, 0]);
+  Future<void> buzz() =>
+      _send(Cmd.runHapticsPattern, const [hapticShortPulse, 0, 0, 0, 0]);
 
   /// Enable live foreground streams. Optical stays WRIST-GATED (0x6B only).
   Future<void> enableLiveStreams() async {
     _liveEnabled = true;
+    if (_phase == BleConnState.ready) _setPhase(BleConnState.live);
     await _send(Cmd.toggleRealtimeHr, const [0x01]);
     await Future.delayed(const Duration(milliseconds: 100));
     await _send(Cmd.sendR10R11Realtime, const [0x01]);
@@ -588,25 +671,155 @@ class BleEngine {
     }
     _liveEnabled = false;
     state.liveHr = null;
+    if (_phase == BleConnState.live) _setPhase(BleConnState.ready);
     onState(state);
   }
 
-  Future<void> disconnect() async {
-    _heartbeat?.cancel();
-    _heartbeat = null;
-    if (_liveEnabled) {
+  /// Idempotent, intentional teardown. Safe to call repeatedly.
+  Future<void> disconnect() => _locked(() async {
+        if (_liveEnabled && _session?.connected == true) {
+          try {
+            await disableLiveStreams();
+          } catch (_) {}
+        }
+        await _teardownSession(intentional: true);
+        _setPhase(BleConnState.idle);
+        _log('Disconnected.');
+      });
+
+  /// Tear down the current session: cancel every subscription + timer, drop the
+  /// BLE link, null all per-connection state. Called for BOTH intentional
+  /// disconnect and (via [_onLinkDown]) an OS-driven drop.
+  Future<void> _teardownSession({required bool intentional}) async {
+    final session = _session;
+    if (session == null) return;
+    session.intentionalClose = intentional;
+    _drain?.onLinkDown();
+    final device = session.device;
+    await session.teardown();
+    _session = null;
+    if (intentional) {
       try {
-        await disableLiveStreams();
+        await device.disconnect();
       } catch (_) {}
     }
-    for (final s in _subs) {
-      await s.cancel();
+  }
+}
+
+/// Event-driven historical-drain controller. Owns the buffered records, the
+/// ts/counter tracking, the idle watchdog, and the completion Future. It is fed
+/// by the engine's frame handler (records + markers) and by link-down events; it
+/// completes its [run] Future on the first stop condition.
+class _DrainController {
+  final SampleSink onRecord;
+  final BatchSink? onRecordsBatch;
+  final void Function(String) log;
+  final DrainStopEvaluator evaluator;
+
+  _DrainController({
+    required this.onRecord,
+    required this.onRecordsBatch,
+    required this.log,
+    required this.evaluator,
+  });
+
+  final List<RawRecord> _raws = [];
+  final List<Sample?> _samples = [];
+
+  int records = 0;
+  int batches = 0;
+  bool _complete = false;
+  bool _linkDown = false;
+  int _lastTsSec = 0;
+  DateTime _lastNewRecordAt = DateTime.now();
+  final DateTime _start = DateTime.now();
+
+  final Completer<SyncReport> _done = Completer<SyncReport>();
+  Timer? _poll;
+
+  void onHistoricalRecord(RawRecord raw, Sample? sample, int tsSec) {
+    records++;
+    _lastNewRecordAt = DateTime.now();
+    if (tsSec > 0) _lastTsSec = tsSec;
+    if (onRecordsBatch != null) {
+      _raws.add(raw);
+      _samples.add(sample);
+    } else {
+      onRecord(sample, raw);
     }
-    _subs.clear();
+  }
+
+  void noteBatchAcked() => batches++;
+
+  void onComplete() {
+    _complete = true;
+    // HISTORY_COMPLETE already flushed in the marker handler — finish now.
+    if (!_done.isCompleted) unawaited(_finish(DrainStop.complete));
+  }
+
+  void onLinkDown() {
+    // Flag it; run()'s 1s loop observes it and finishes WITHOUT sending an abort
+    // on a dead link. Safe to call before run() starts or after it finishes.
+    _linkDown = true;
+  }
+
+  /// Persist buffered records in one transaction. Snapshots the buffer so records
+  /// arriving during the await land in the next flush.
+  Future<void> flush() async {
+    if (onRecordsBatch == null || _raws.isEmpty) return;
+    final raws = List<RawRecord>.from(_raws);
+    final samples = List<Sample?>.from(_samples);
+    _raws.clear();
+    _samples.clear();
     try {
-      await _device?.disconnect();
-    } catch (_) {}
-    _setConn('disconnected');
-    _log('Disconnected.');
+      await onRecordsBatch!(raws, samples);
+    } catch (e) {
+      log('drain flush error: $e');
+    }
+  }
+
+  /// Drive the drain to completion. Polls the pure stop-evaluator every second
+  /// (the protocol is push, but the live-edge / idle / timeout conditions are
+  /// time-based). Sends ABORT_HISTORICAL on live-edge / idle exits.
+  Future<SyncReport> run({
+    required bool Function() isLinkUp,
+    required Future<void> Function() sendAbort,
+  }) async {
+    _poll = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (_done.isCompleted) return;
+      if (!isLinkUp()) _linkDown = true;
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final stop = evaluator.evaluate(
+        complete: _complete,
+        linkDown: _linkDown,
+        records: records,
+        lastRecordTsSec: _lastTsSec,
+        nowSec: nowSec,
+        sinceStart: DateTime.now().difference(_start),
+        sinceLastNewRecord: DateTime.now().difference(_lastNewRecordAt),
+      );
+      if (stop == DrainStop.keepGoing) return;
+      // Live-edge / idle exits politely tell the band to stop transmitting.
+      if ((stop == DrainStop.liveEdge || stop == DrainStop.idle) && isLinkUp()) {
+        log('[SYNC] stop=$stop — sending ABORT_HISTORICAL.');
+        try {
+          await sendAbort();
+        } catch (_) {}
+      } else {
+        log('[SYNC] stop=$stop.');
+      }
+      await _finish(stop);
+    });
+    return _done.future;
+  }
+
+  Future<void> _finish(DrainStop stop) async {
+    if (_done.isCompleted) return;
+    _poll?.cancel();
+    _poll = null;
+    // Persist anything still buffered on a non-COMPLETE exit (those paths don't
+    // get a HistoryComplete marker; COMPLETE/END already flushed).
+    await flush();
+    _done.complete(SyncReport(records, batches, stop == DrainStop.complete));
   }
 }
