@@ -9,6 +9,7 @@ import 'theme/theme_switcher.dart';
 import 'theme/tokens.dart';
 import 'ui/kit/kit.dart';
 import 'ui/pairing_screen.dart';
+import 'ui/profile_setup_screen.dart';
 import 'ui/today/today_screen.dart';
 import 'ui/screens/screens.dart';
 import 'ui/workouts/workouts_screen.dart';
@@ -94,6 +95,8 @@ class _Gate extends StatelessWidget {
         );
       case AppRoute.pairing:
         return PairingScreen();
+      case AppRoute.profile:
+        return const ProfileSetupScreen();
       case AppRoute.shell:
         return _Shell();
     }

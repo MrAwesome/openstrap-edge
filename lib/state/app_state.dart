@@ -42,9 +42,10 @@ import '../widget/widget_service.dart';
 import '../sync/file_log.dart';
 
 /// The onboarding/app gate states, in order. See [AppState.route].
-/// CLOUD EXCISED: the old backend / auth / profile states are gone — once a band
-/// is paired we go straight to the shell.
-enum AppRoute { loading, pairing, shell }
+/// Flow: loading → pairing → profile (only if incomplete) → shell. The profile
+/// step collects age/weight/height/sex so the on-device analytics can
+/// personalize (HRmax, calories, TRIMP); it's skipped once those are set.
+enum AppRoute { loading, pairing, profile, shell }
 
 class AppState extends ChangeNotifier {
   late final BleEngine engine;
@@ -145,8 +146,12 @@ class AppState extends ChangeNotifier {
   AppRoute get route {
     if (!initialized) return AppRoute.loading;
     if (!isPaired) return AppRoute.pairing;
+    if (!profileComplete) return AppRoute.profile;
     return AppRoute.shell;
   }
+
+  /// True once the profile has the fields the analytics personalization needs.
+  bool get profileComplete => _profile.isComplete;
 
   // ── app status: OTA update pointer + admin-pushed alert banner ──────────────
   // Now fetched directly by UpdateService from a public, unauthenticated pointer
