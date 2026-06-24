@@ -29,6 +29,7 @@ class LocalDb {
         await _createSamples(db);
         await db.execute('CREATE INDEX idx_samples_ts ON samples(ts)');
         await _createEvents(db);
+        await _createDerived(db);
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV < 2) await _createEvents(db);
@@ -48,9 +49,60 @@ class LocalDb {
           await _createSamples(db);
           await db.execute('CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts)');
         }
+        if (oldV < 5) {
+          // LOCAL-FIRST re-layer: the on-device DerivationEngine now computes the
+          // full 1 Hz analytics family from raw and stores PERMANENT derived rows.
+          // Purely additive — raw tables are untouched.
+          await _createDerived(db);
+        }
       },
-      version: 4,
+      version: 5,
     );
+  }
+
+  // ── DERIVED STORE (permanent, rich) ────────────────────────────────────────
+  // The on-device analytics output, keyed by physiological day (wake-to-wake;
+  // the `date` label is edge-supplied, display-only). These rows are PERMANENT —
+  // raw is pruned after derivation (rawRetentionDays) but the derived bundle is
+  // the long-term system of record the UI reads from. See lib/compute/.
+  static Future<void> _createDerived(Database db) async {
+    // derived_day — one row per physiological day. `payload_json` is the full
+    // result bundle (all clinical/sleep/respiration/motion/wellness/human metrics,
+    // each keeping its tier/confidence/inputs_used) PLUS the per-minute/curve
+    // series the UI needs (HR curve, HRV timeline, hypnogram). Frequently queried
+    // scalars are indexed into columns for cheap trends.
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS derived_day (
+        date TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        last_raw_ts INTEGER NOT NULL,
+        computed_at INTEGER NOT NULL,
+        rhr REAL,
+        rmssd REAL,
+        readiness REAL
+      )
+    ''');
+    // baselines — rolling personal baselines, so a derivation pass reuses stored
+    // state instead of refolding full history each time.
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS baselines (
+        key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    ''');
+    // metric_series — long-format scalars for trends / sparklines.
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS metric_series (
+        date TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value REAL,
+        PRIMARY KEY (date, key)
+      )
+    ''');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_metric_series_key ON metric_series(key, date)');
   }
 
   // samples — header-only record index (counter, ts, hr). The band is a raw pipe;
@@ -234,5 +286,162 @@ class LocalDb {
             .rawQuery('SELECT COUNT(*) FROM raw_records WHERE uploaded = 0')) ??
         0;
     return {'raw': raw, 'pending': pending};
+  }
+
+  // ── raw read (for the DerivationEngine — main isolate only) ─────────────────
+
+  /// All raw record hexes captured in [fromMs, toMs] (epoch ms = captured_at),
+  /// oldest first. The engine decodes these via openstrap_protocol off-isolate.
+  static Future<List<String>> rawHexInCaptureRange(int fromMs, int toMs) async {
+    final db = await instance;
+    final rows = await db.query('raw_records',
+        columns: ['hex'],
+        where: 'captured_at >= ? AND captured_at <= ?',
+        whereArgs: [fromMs, toMs],
+        orderBy: 'captured_at ASC');
+    return rows.map((m) => m['hex'] as String).toList();
+  }
+
+  /// The newest `captured_at` (epoch ms) across all raw — used to find days with
+  /// new raw to (re)derive. Null if the store is empty.
+  static Future<int?> latestRawCapturedAt() async {
+    final db = await instance;
+    return Sqflite.firstIntValue(
+        await db.rawQuery('SELECT MAX(captured_at) FROM raw_records'));
+  }
+
+  /// The oldest `captured_at` (epoch ms) across all raw. Null if empty.
+  static Future<int?> earliestRawCapturedAt() async {
+    final db = await instance;
+    return Sqflite.firstIntValue(
+        await db.rawQuery('SELECT MIN(captured_at) FROM raw_records'));
+  }
+
+  // ── derived store I/O (main isolate only — sqflite isn't isolate-safe) ──────
+
+  /// Upsert a derived-day bundle + its indexed scalars in one transaction.
+  static Future<void> putDerivedDay({
+    required String date,
+    required String payloadJson,
+    required int version,
+    required int lastRawTs,
+    double? rhr,
+    double? rmssd,
+    double? readiness,
+    Map<String, double?> series = const {},
+  }) async {
+    final db = await instance;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    await db.transaction((txn) async {
+      await txn.insert(
+        'derived_day',
+        {
+          'date': date,
+          'payload_json': payloadJson,
+          'version': version,
+          'last_raw_ts': lastRawTs,
+          'computed_at': now,
+          'rhr': rhr,
+          'rmssd': rmssd,
+          'readiness': readiness,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      for (final e in series.entries) {
+        await txn.insert(
+          'metric_series',
+          {'date': date, 'key': e.key, 'value': e.value},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
+  }
+
+  /// The full derived row for one day (or null). Columns + decoded payload_json.
+  static Future<Map<String, dynamic>?> derivedDay(String date) async {
+    final db = await instance;
+    final rows =
+        await db.query('derived_day', where: 'date = ?', whereArgs: [date], limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  /// The most recent derived row (highest date label), or null.
+  static Future<Map<String, dynamic>?> latestDerivedDay() async {
+    final db = await instance;
+    final rows = await db.query('derived_day', orderBy: 'date DESC', limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  /// Derived rows whose `date` is in [from, to] (inclusive string labels),
+  /// newest first.
+  static Future<List<Map<String, dynamic>>> derivedDaysBetween(
+      String from, String to) async {
+    final db = await instance;
+    return db.query('derived_day',
+        where: 'date >= ? AND date <= ?', whereArgs: [from, to], orderBy: 'date DESC');
+  }
+
+  /// The N most recent derived rows, newest first.
+  static Future<List<Map<String, dynamic>>> recentDerivedDays(int limit) async {
+    final db = await instance;
+    return db.query('derived_day', orderBy: 'date DESC', limit: limit);
+  }
+
+  /// `{date -> last_raw_ts}` for every derived day — the engine compares these
+  /// against the raw it has to decide which days need (re)derivation.
+  static Future<Map<String, int>> derivedLastRawTs() async {
+    final db = await instance;
+    final rows = await db.query('derived_day', columns: ['date', 'last_raw_ts']);
+    return {for (final r in rows) r['date'] as String: r['last_raw_ts'] as int};
+  }
+
+  /// A long-format metric series (oldest first) for trends/sparklines.
+  static Future<List<Map<String, dynamic>>> metricSeries(String key,
+      {int? limit}) async {
+    final db = await instance;
+    return db.query('metric_series',
+        where: 'key = ? AND value IS NOT NULL',
+        whereArgs: [key],
+        orderBy: 'date ASC',
+        limit: limit);
+  }
+
+  static Future<Map<String, dynamic>?> baseline(String key) async {
+    final db = await instance;
+    final rows =
+        await db.query('baselines', where: 'key = ?', whereArgs: [key], limit: 1);
+    return rows.isEmpty ? null : rows.first;
+  }
+
+  static Future<void> putBaseline(String key, String payloadJson) async {
+    final db = await instance;
+    await db.insert(
+      'baselines',
+      {
+        'key': key,
+        'payload_json': payloadJson,
+        'updated_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  // ── raw pruning (raw-first invariant) ───────────────────────────────────────
+
+  /// Delete raw_records / samples / events captured strictly before [cutoffMs].
+  /// The caller is responsible for only pruning windows that are FULLY DERIVED —
+  /// never prune raw for a day that hasn't been derived yet. Returns rows deleted.
+  static Future<int> pruneRawBefore(int cutoffMs) async {
+    final db = await instance;
+    int deleted = 0;
+    await db.transaction((txn) async {
+      deleted = await txn
+          .delete('raw_records', where: 'captured_at < ?', whereArgs: [cutoffMs]);
+      // samples is keyed by counter with its own ts (epoch seconds); prune in
+      // step using the same cutoff converted to seconds.
+      await txn.delete('samples', where: 'ts < ?', whereArgs: [cutoffMs ~/ 1000]);
+      await txn.delete('events', where: 'captured_at < ?', whereArgs: [cutoffMs]);
+    });
+    return deleted;
   }
 }

@@ -13,11 +13,13 @@ dependencies:
 
   # Local pure-Dart packages — the protocol byte codecs and the metric/analytics
   # engine. Replace the old cloud backend: decode happens on-device, and the
-  # future local re-layer computes metrics here (see lib/data/local_repository.dart).
+  # local re-layer computes metrics here (see lib/data/local_repository.dart +
+  # lib/compute/derivation_engine.dart). The analytics package now points at the
+  # 1 Hz-native family (import via `package:openstrap_analytics/onehz.dart`).
   openstrap_protocol:
     path: ../openstrap-protocol-dart
   openstrap_analytics:
-    path: ../openstrap-analytics-dart
+    path: ../openstrap-analytics-onehz
 
   # BLE — flutter_blue_plus is the maintained cross-platform GATT client.
   flutter_blue_plus: ^1.35.5
@@ -26,6 +28,12 @@ dependencies:
   sqflite: ^2.4.1
   path: ^1.9.0
   path_provider: ^2.1.5
+
+  # Background scheduled derivation (the heavy nightly pass: sleep staging +
+  # 24-h spectra). Android: a real OS-scheduled WorkManager job. iOS: see the
+  # honest caveat in lib/compute/background_derivation.dart — app-killed heavy
+  # compute is opportunistic via BGTaskScheduler, never guaranteed.
+  workmanager: ^0.5.2
 
   # HTTP — retained ONLY for the OTA self-update pointer (see lib/sync/update_service.dart)
   # and the AI Coach's direct LLM (BYOK) calls. No backend / auth traffic anymore.
