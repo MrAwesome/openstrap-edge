@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import 'app.dart';
 import 'ble/ios_ble_restore.dart';
+import 'compute/background_derivation.dart';
 import 'notify/notification_service.dart';
 import 'coach/coach_config.dart';
 import 'state/app_state.dart';
@@ -33,6 +34,9 @@ Future<void> main() async {
   await _safeInit('IosBleRestore', IosBleRestore.init);
   await _safeInit('WidgetService', WidgetService.init);
   await _safeInit('NotificationService', NotificationService.instance.init);
+  // Schedule the heavy nightly derivation (Android WorkManager; iOS no-op — see
+  // the honest caveat in background_derivation.dart). Best-effort.
+  await _safeInit('BackgroundDerivation', BackgroundDerivation.init);
 
   // Resolve appearance (persisted choice + OS brightness) BEFORE the first frame
   // so login/signup already paint in the right mode (Ember on Paper / Char).

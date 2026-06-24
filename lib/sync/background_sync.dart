@@ -9,11 +9,28 @@
 // local SQLite store (lib/data/db.dart), the system of record. A missed run is
 // harmless; the next reconnect catches up from the non-destructive cursor.
 
+import 'dart:convert';
+
 import 'package:flutter/widgets.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ble/ble_engine.dart';
+import '../compute/derivation_engine.dart';
+import '../compute/profile.dart';
 import '../data/db.dart';
 import 'paired_device.dart';
+
+/// Load the local profile (no Provider in the headless isolate).
+Future<Profile> _loadProfile() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('local_profile_json');
+    if (raw == null) return const Profile();
+    return Profile.fromMap((jsonDecode(raw) as Map).cast<String, dynamic>());
+  } catch (_) {
+    return const Profile();
+  }
+}
 
 /// One headless LOCAL drain pass. Safe to call from a background isolate. Never
 /// throws. Connects-by-id if reachable, drains whatever the band buffered to
@@ -51,7 +68,17 @@ Future<bool> runHeadlessSync() async {
     } finally {
       await engine.disconnect();
     }
-    debugPrint('[bgsync] done (local drain only).');
+    // Within the SAME background wake slot: capture raw AND derive the fresh
+    // window (bounded LIGHT pass — newest affected day only — so we stay inside
+    // the short iOS execution budget). Best-effort; if the slot ends first, the
+    // light pass on the next drain or the foreground finalize catches up.
+    try {
+      await DerivationEngine(log: (l) => debugPrint('[bgsync-derive] $l'))
+          .run(await _loadProfile());
+    } catch (e) {
+      debugPrint('[bgsync] derive skipped: $e');
+    }
+    debugPrint('[bgsync] done (local drain + light derive).');
     return true;
   } catch (e) {
     debugPrint('[bgsync] error (ignored): $e');

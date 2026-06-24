@@ -23,8 +23,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/app_status.dart';
 import '../ble/ble_engine.dart';
 import '../ble/ios_ble_restore.dart';
+import '../compute/derivation_engine.dart';
+import '../compute/profile.dart';
 import '../data/db.dart';
 import '../data/local_repository.dart';
+import '../data/local_repository_impl.dart';
 import '../gestures/gesture_settings.dart';
 import '../gestures/gesture_dispatcher.dart';
 import '../data/models.dart';
@@ -47,11 +50,19 @@ class AppState extends ChangeNotifier {
   late final BleEngine engine;
   PairedDevice? paired;
 
-  /// SEAM: the screen data layer. Today every method throws UnimplementedError
-  /// (see lib/data/local_repository.dart) — the future re-layer implements it
-  /// against openstrap_analytics over lib/data/db.dart. Null until set by a
-  /// re-layer; screens guard on `repo == null` exactly as they used to on `api`.
+  /// SEAM: the screen data layer. Wired to [LocalRepositoryImpl] in the ctor —
+  /// it reads the precomputed derived_day / metric_series rows (ZERO heavy
+  /// compute on read). Screens still guard on `repo == null` exactly as they did
+  /// on `api`.
   LocalRepository? repo;
+
+  /// The on-device compute orchestrator. Kicked (light) after every drain/flush
+  /// completion, and (heavy) on foreground finalize. Background heavy passes run
+  /// via WorkManager (Android) — see lib/compute/background_derivation.dart.
+  late final DerivationEngine _derive = DerivationEngine(log: _log);
+
+  /// Profile fed to the analytics (HRmax/calories/TRIMP personalization).
+  Profile get _profile => Profile.fromMap(user);
 
   DeviceState get device => engine.state;
   final DeviceAlerts _deviceAlerts = DeviceAlerts();
@@ -203,7 +214,22 @@ class AppState extends ChangeNotifier {
       onEvent: _onLiveEvent,
       onRecordsBatch: LocalDb.insertRecordsBatch,
     );
+    repo = LocalRepositoryImpl(getProfileMap: () => user);
     _init();
+  }
+
+  /// Compute trigger: kick the DerivationEngine after a drain/flush COMPLETES.
+  /// [heavy]=false is the bounded light pass (newest affected day) we run inside
+  /// a short background BLE wake; [heavy]=true is the foreground finalize sweep.
+  /// Best-effort + non-blocking — never throws into the BLE path. Refreshes the
+  /// UI when results land so screens re-read the fresh derived rows.
+  Future<void> _afterDrain({bool heavy = false}) async {
+    try {
+      await _derive.run(_profile, heavy: heavy);
+      notifyListeners(); // screens re-fetch from the derived store
+    } catch (e) {
+      _log('[derive] post-drain failed: $e');
+    }
   }
 
   // Live (foreground / kept-alive) event path: persist every event, then let the
@@ -442,6 +468,9 @@ class AppState extends ChangeNotifier {
       _log('Drained ${report.records} records in ${report.batches} batches '
           '(${report.complete ? "complete" : "idle-stopped"}).');
       dbCounts = await LocalDb.counts();
+      // Drain COMPLETE → derive. Foreground session: heavy finalize sweep (full
+      // sleep staging + 24-h spectra over every stale day). Non-blocking.
+      unawaited(_afterDrain(heavy: true));
     } catch (e) {
       lastError = e.toString();
     } finally {
@@ -474,6 +503,8 @@ class AppState extends ChangeNotifier {
           await engine.enableLiveStreams();
           dbCounts = await LocalDb.counts();
           _log('Reconnected — backlog drained.');
+          // Backlog (often an overnight gap) just landed → derive it.
+          unawaited(_afterDrain(heavy: true));
           break;
         }
       }
@@ -494,6 +525,8 @@ class AppState extends ChangeNotifier {
       await engine.enableLiveStreams();
       dbCounts = await LocalDb.counts();
       notifyListeners();
+      // A just-finished workout window landed from flash → derive it (light).
+      unawaited(_afterDrain());
     } catch (e) {
       _log('Resync failed: $e');
     }
