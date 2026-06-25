@@ -6,6 +6,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../../data/db.dart';
 import '../../state/app_state.dart';
@@ -25,6 +26,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   Map<String, dynamic>? _cross;
   Map<String, dynamic>? _latest; // latest derived_day bundle (decoded)
   bool _loading = true;
+  bool _exporting = false;
 
   // Inner packet-type byte → friendly label.
   static const Map<int, String> _types = {
@@ -113,6 +115,8 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
                 _crossSection(),
                 const SizedBox(height: Sp.x6),
                 _reanalyze(app),
+                const SizedBox(height: Sp.x3),
+                _exportRow(),
                 const SizedBox(height: Sp.x6),
                 _logSection(app),
               ],
@@ -264,6 +268,34 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
             if (app.reanalyzing) return;
             await app.reanalyzeAll();
             await _load();
+          },
+        ),
+      );
+
+  Widget _exportRow() => ProCard(
+        padding: const EdgeInsets.symmetric(horizontal: Sp.x5, vertical: Sp.x2),
+        child: DetailRow(
+          icon: Ic.server,
+          label: 'Export data (SQLite)',
+          value: _exporting ? 'Exporting…' : 'Share',
+          onTap: () async {
+            if (_exporting) return;
+            setState(() => _exporting = true);
+            try {
+              final path = await LocalDb.exportCopy();
+              await Share.shareXFiles(
+                [XFile(path)],
+                subject: 'OpenStrap data export',
+                text: 'OpenStrap local DB (raw + derived).',
+              );
+            } catch (e) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Export failed: $e')));
+              }
+            } finally {
+              if (mounted) setState(() => _exporting = false);
+            }
           },
         ),
       );

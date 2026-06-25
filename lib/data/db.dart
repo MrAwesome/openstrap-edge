@@ -8,9 +8,11 @@
 // key — re-draining the same flash region inserts nothing new (INSERT OR IGNORE).
 
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:openstrap_protocol/openstrap_protocol.dart' as proto;
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'models.dart';
 
@@ -548,6 +550,23 @@ class LocalDb {
   static Future<List<Map<String, dynamic>>> recentDerivedDays(int limit) async {
     final db = await instance;
     return db.query('derived_day', orderBy: 'date DESC', limit: limit);
+  }
+
+  /// Copy the live SQLite DB to a temp file for export/sharing. Folds the WAL
+  /// into the main file first so the copy is a complete, consistent snapshot
+  /// (raw_records + derived_day + baselines + everything). Returns the path.
+  static Future<String> exportCopy() async {
+    final db = await instance;
+    try {
+      await db.execute('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch (_) {/* best-effort */}
+    final dir = await getDatabasesPath();
+    final src = p.join(dir, 'openstrap.db');
+    final tmp = await getTemporaryDirectory();
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final dest = p.join(tmp.path, 'openstrap_export_$stamp.db');
+    await File(src).copy(dest);
+    return dest;
   }
 
   // ── diagnostics (read-only summaries for the Diagnostics screen) ────────────
