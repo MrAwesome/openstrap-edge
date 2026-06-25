@@ -1,6 +1,8 @@
 // Profile and settings — account, paired device, profile fields, and backend.
 // Edits use bottom sheets; destructive actions confirm.
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -522,6 +524,12 @@ class _DeviceHero extends StatelessWidget {
                     Text(statusText,
                         style: AppText.caption
                             .copyWith(color: AppColors.onNightSoft)),
+                    // Single listening mode: show data freshness instead of a
+                    // syncing/live flip. Throttled to ~1/s with a subtle pulse.
+                    if (conn == 'connected') ...[
+                      const SizedBox(width: Sp.x3),
+                      const Expanded(child: LastDataIndicator()),
+                    ],
                   ]),
                 ],
               ),
@@ -557,12 +565,11 @@ class _DeviceHero extends StatelessWidget {
   }
 
   (Color, String) _status(String conn, bool uploading) {
-    if (uploading) return (AppColors.coral, 'Syncing…');
     switch (conn) {
       case 'connected':
-        return (AppColors.good, 'Connected');
-      case 'syncing':
-        return (AppColors.coral, 'Syncing…');
+        // Single listening mode — no separate "syncing" state. History + live
+        // records both stream here; freshness is shown by "last data: Xs ago".
+        return (AppColors.good, 'Listening');
       case 'connecting':
       case 'scanning':
         return (AppColors.warn, 'Connecting…');
@@ -594,6 +601,75 @@ class _Stat extends StatelessWidget {
               style: AppText.title.copyWith(color: AppColors.onNight)),
         ],
       );
+}
+
+/// "last data: Xs ago" — driven by the engine's last-RX time. Refreshes at most
+/// ~1/s on its OWN timer (so live HR's ~1 Hz notifyListeners doesn't hard-rebuild
+/// this, and vice-versa) and gives a SMALL scale pulse when fresh data lands.
+class LastDataIndicator extends StatefulWidget {
+  const LastDataIndicator({super.key});
+  @override
+  State<LastDataIndicator> createState() => _LastDataIndicatorState();
+}
+
+class _LastDataIndicatorState extends State<LastDataIndicator> {
+  Timer? _ticker;
+  DateTime? _lastSeen; // last lastDataAt we observed (to detect a fresh frame)
+  bool _pulse = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Throttle: one refresh per second, max. The bounce is driven off the change
+    // in lastDataAt, not a flag flip per build.
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final now = context.read<AppState>().lastDataAt;
+      if (now != null && now != _lastSeen) {
+        _lastSeen = now;
+        // Toggle the scale up for a single frame, then settle — a subtle pulse.
+        setState(() => _pulse = true);
+        Future.delayed(const Duration(milliseconds: 180), () {
+          if (mounted) setState(() => _pulse = false);
+        });
+      } else {
+        setState(() {}); // just refresh the "Xs ago" text
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  String _ago(DateTime? at) {
+    if (at == null) return 'waiting for data…';
+    final s = DateTime.now().difference(at).inSeconds;
+    if (s <= 1) return 'last data: just now';
+    if (s < 60) return 'last data: ${s}s ago';
+    final m = s ~/ 60;
+    if (m < 60) return 'last data: ${m}m ago';
+    return 'last data: ${m ~/ 60}h ago';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final at = context.read<AppState>().lastDataAt;
+    return AnimatedScale(
+      scale: _pulse ? 1.06 : 1.0,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
+      alignment: Alignment.centerLeft,
+      child: Text(
+        _ago(at),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: AppText.caption.copyWith(color: AppColors.onNightSoft),
+      ),
+    );
+  }
 }
 
 // ── Device detail sheet (rename / alarm / forget) ──────────────────────────

@@ -96,7 +96,7 @@ class _LiveHrTileState extends State<LiveHrTile> with TickerProviderStateMixin {
     });
     final (hr, at, conn) = snap;
 
-    final connected = conn == 'connected' || conn == 'syncing';
+    final connected = conn == 'connected';
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final fresh = at != null && (nowMs - at) < _staleMs;
     final offWrist = hr == 0; // 0 is OFF-WRIST, never a heart rate

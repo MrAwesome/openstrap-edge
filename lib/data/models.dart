@@ -58,7 +58,7 @@ class DeviceState {
   int? liveHrAt; // epoch ms
   int? alarmEpoch; // current strap alarm (unix sec) from GET_ALARM_TIME, if read
   String? strapName; // strap advertising name (editable via SET_ADVERTISING_NAME)
-  String connection; // 'disconnected' | 'scanning' | 'connecting' | 'connected' | 'syncing'
+  String connection; // 'disconnected' | 'scanning' | 'connecting' | 'connected'
 
   DeviceState({this.connection = 'disconnected'});
 }

@@ -13,8 +13,15 @@
 //   * A per-connection `_Session` that owns the device, characteristics, the
 //     three reassemblers, EVERY stream subscription, and the heartbeat timer —
 //     torn down atomically on disconnect so nothing leaks across reconnects.
-//   * An event-driven drain controller that completes on HISTORY_COMPLETE,
-//     live-edge, idle, timeout, OR link-drop (no busy-poll that ignores drops).
+//   * A single LISTENING mode. Once the link is up we subscribe → SET_CLOCK →
+//     INIT (which triggers the historical flood) → then JUST KEEP LISTENING.
+//     Historical records and live records arrive on the SAME data stream; we ACK
+//     every HISTORY_END marker as it comes and store every record. There is no
+//     "syncing → live" flip, no live-edge cutoff, no idle-timeout that ends a
+//     phase. The historical offload runs to HISTORY_COMPLETE (which is what
+//     durably advances the band's read cursor — cutting it short was the
+//     "Groundhog Day" re-flood bug); once complete the same subscription keeps
+//     delivering live records with no mode change.
 //
 // SAFETY: we NEVER send a dangerousCmd (FORCE_TRIM 0x19 / REBOOT 0x1D /
 // TOGGLE_PERSISTENT_R21 0x9A). Optical is wrist-gated (0x6B only).
@@ -24,8 +31,9 @@
 // never collide.
 //
 // PUBLIC SURFACE consumed by AppState / background_sync / edge_tracking. The
-// drain-completion signal the DerivationEngine depends on — runSync() returning
-// SyncReport after the final flush — is part of that surface.
+// DerivationEngine no longer keys off a discrete "sync done" — instead the engine
+// fires a debounced `onDataStored` callback after records are persisted (coalescing
+// bursts), so the compute trigger survives the move to continuous listening.
 
 import 'dart:async';
 import 'dart:io';
@@ -47,6 +55,11 @@ typedef LogSink = void Function(String line);
 typedef EventSink = void Function(int eventId, int tsEpoch, String hex);
 typedef BatchSink = Future<void> Function(
     List<RawRecord> raws, List<Sample?> samples);
+
+/// Fired (debounced) after records are persisted so the caller can schedule a
+/// DerivationEngine pass. Replaces the old "runSync() → SyncReport → derive"
+/// trigger now that listening is continuous and there's no discrete sync end.
+typedef DataStoredSink = void Function();
 
 class SyncReport {
   final int records;
@@ -102,12 +115,24 @@ class BleEngine {
   /// (one DB transaction per ACK boundary) instead of one-by-one via [onRecord].
   final BatchSink? onRecordsBatch;
 
+  /// Debounced "new data stored" trigger. Fired once an inbound burst goes quiet
+  /// (see [DeriveDebouncer]) so the caller can schedule a single derive pass per
+  /// burst instead of per record. Optional (null in headless contexts that drive
+  /// their own derive).
+  final DataStoredSink? onDataStored;
+
+  /// Tunable debounce window for [onDataStored]. Default coalesces a burst once the
+  /// stream goes quiet for ~12s, with a 90s never-quiet floor.
+  final DeriveDebouncer deriveDebouncer;
+
   BleEngine({
     required this.onRecord,
     required this.onState,
     this.log,
     this.onEvent,
     this.onRecordsBatch,
+    this.onDataStored,
+    this.deriveDebouncer = const DeriveDebouncer(),
   });
 
   final DeviceState state = DeviceState();
@@ -131,7 +156,9 @@ class BleEngine {
   /// The delay to wait before reconnect `attempt` (1-based). Bounded + jittered.
   Duration reconnectDelay(int attempt) => reconnectPolicy.delayFor(attempt);
 
-  // Drain bookkeeping (only valid while syncing).
+  // Historical-offload bookkeeping. A controller is live for the whole connection
+  // (we keep ACKing HISTORY_END markers as they arrive, even after the first
+  // HISTORY_COMPLETE — a later strap-triggered offload reuses it).
   _DrainController? _drain;
   bool _liveEnabled = false;
 
@@ -139,11 +166,48 @@ class BleEngine {
   // can resume the app with the peripheral still flagged "connected" while its
   // GATT notifications silently died during suspension — the UI reads connected
   // but no events arrive. The foreground-reclaim path consults this to tell a
-  // genuinely live link (recent data) from a stale one.
+  // genuinely live link (recent data) from a stale one. Also drives the UI's
+  // "last data: Xs ago" readout.
   DateTime _lastRx = DateTime.fromMillisecondsSinceEpoch(0);
   Duration get sinceLastRx => DateTime.now().difference(_lastRx);
 
+  /// Wall-clock of the last received BLE notification (any characteristic), for the
+  /// UI's "last data: Xs ago". `null` until the first frame this connection.
+  DateTime? get lastRxAt =>
+      _lastRx.millisecondsSinceEpoch == 0 ? null : _lastRx;
+
+  // ── debounced "new data stored → derive" trigger ─────────────────────────────
+  // Continuous listening has no discrete "sync done", so we coalesce stored-record
+  // bursts: mark dirty on persist, and fire onDataStored once the stream goes quiet.
+  DateTime _lastStored = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _firstPending; // start of the current un-derived run
+  Timer? _deriveTimer;
+
   void _log(String s) => log?.call(s);
+
+  /// Note that records were just persisted; (re)arm the debounced derive trigger.
+  /// Called from the record-store paths. No-op when no [onDataStored] is wired.
+  void _noteStored() {
+    if (onDataStored == null) return;
+    final now = DateTime.now();
+    _lastStored = now;
+    _firstPending ??= now;
+    _deriveTimer ??= Timer.periodic(const Duration(seconds: 2), (_) {
+      final fp = _firstPending;
+      if (fp == null) return;
+      final fire = deriveDebouncer.shouldDerive(
+        hasPending: true,
+        sinceLastRecord: DateTime.now().difference(_lastStored),
+        sinceFirstPending: DateTime.now().difference(fp),
+      );
+      if (fire) {
+        _firstPending = null;
+        _deriveTimer?.cancel();
+        _deriveTimer = null;
+        onDataStored!.call();
+      }
+    });
+  }
 
   void _setPhase(BleConnState p) {
     _phase = p;
@@ -152,10 +216,7 @@ class BleEngine {
   }
 
   bool get isConnected =>
-      _session?.connected == true &&
-      (_phase == BleConnState.ready ||
-          _phase == BleConnState.live ||
-          _phase == BleConnState.syncing);
+      _session?.connected == true && _phase == BleConnState.listening;
 
   /// Run [body] under the single in-flight guard. Chains onto the existing op so
   /// callers can never start two transport operations concurrently.
@@ -223,9 +284,7 @@ class BleEngine {
         if (_session != null &&
             _session!.connected &&
             _session!.device.remoteId == device.remoteId &&
-            (_phase == BleConnState.ready ||
-                _phase == BleConnState.live ||
-                _phase == BleConnState.syncing)) {
+            _phase == BleConnState.listening) {
           _log('connect: already connected to ${device.remoteId.str} — reusing.');
           return true;
         }
@@ -354,8 +413,20 @@ class BleEngine {
     });
 
     _lastRx = DateTime.now(); // fresh link — never treat as stale on resume
-    _setPhase(BleConnState.ready);
-    _log('Connected + subscribed.');
+
+    // SINGLE LISTENING MODE. Arm the offload controller, enter `listening`, then
+    // fire INIT — which triggers the historical flood. Historical + live records
+    // then arrive on the same subscription; HISTORY_END markers are ACKed as they
+    // come and every record is stored. We never "stop syncing and go live" — the
+    // phase stays `listening` for the life of the connection.
+    _drain = _DrainController(
+      onRecord: _storeRecord,
+      onRecordsBatch: onRecordsBatch == null ? null : _storeRecordsBatch,
+      log: _log,
+    );
+    _setPhase(BleConnState.listening);
+    _log('Connected + subscribed — listening (history + live).');
+    await sendInit(); // triggers the historical offload flood
     return true;
   }
 
@@ -424,6 +495,21 @@ class BleEngine {
     await _write(frame);
   }
 
+  // ── record store sinks (wrap the caller's sinks + arm the derive debounce) ──────
+  // The drain controller persists through these so a stored historical batch (or a
+  // single live record) re-arms the debounced onDataStored trigger.
+  Future<void> _storeRecord(Sample? sample, RawRecord raw) async {
+    await onRecord(sample, raw);
+    _noteStored();
+  }
+
+  Future<void> _storeRecordsBatch(
+      List<RawRecord> raws, List<Sample?> samples) async {
+    if (raws.isEmpty) return;
+    await onRecordsBatch!(raws, samples);
+    _noteStored();
+  }
+
   // ── frame handling ─────────────────────────────────────────────────────────────
   void _onFrame(String role, Frame frame) {
     final pt = frame.packetType;
@@ -443,7 +529,7 @@ class BleEngine {
         hex: _innerHex(frame.inner),
         capturedAt: DateTime.now().millisecondsSinceEpoch,
       );
-      onRecord(null, raw);
+      unawaited(_storeRecord(null, raw)); // store + arm the derive debounce
       // Fall through to decodeFrame so the UI gets live telemetry.
     }
     if (pt == PacketType.historicalData) {
@@ -455,11 +541,6 @@ class BleEngine {
         hex: _innerHex(frame.inner),
         capturedAt: DateTime.now().millisecondsSinceEpoch,
       );
-      int ts = 0;
-      if (frame.inner.length >= 11) {
-        final t = u32(frame.inner, 7);
-        if (t > 1000000000) ts = t;
-      }
       Sample? sample;
       if (recType == Record.r24) {
         final r = parseR24(frame.inner);
@@ -472,16 +553,15 @@ class BleEngine {
           sample = Sample(tsEpoch: r.tsEpoch, counter: r.counter, hr: r.hr);
         }
       }
-      // Hand the record to the drain controller (it buffers + tracks ts/counts),
-      // or store directly if no drain is active (shouldn't happen for 0x2F, but
-      // safe).
+      // Hand the record to the offload controller (it buffers per-batch until the
+      // HISTORY_END flush, which persists raw-first BEFORE we ACK). The controller
+      // is armed for the whole connection, so this is always present; the fallback
+      // just stores directly if a frame somehow arrives before setup completed.
       final d = _drain;
       if (d != null) {
-        d.onHistoricalRecord(raw, sample, ts);
-      } else if (onRecordsBatch != null) {
-        unawaited(onRecordsBatch!([raw], [sample]));
+        d.onHistoricalRecord(raw, sample);
       } else {
-        onRecord(sample, raw);
+        unawaited(_storeRecord(sample, raw));
       }
       return;
     }
@@ -551,20 +631,30 @@ class BleEngine {
           m.token!.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
       _log('[SYNC] HistoryEnd batch=${m.batchId} records=${d.records} '
           'token=$tokenHex');
-      // RAW-FIRST: persist this batch BEFORE we ACK (the band's cursor advances
-      // on ACK, so anything unflushed at ACK time could be lost).
+      // RAW-FIRST: persist this batch BEFORE we ACK. The band advances + trims its
+      // read cursor on ACK, so anything unflushed at ACK time could be lost. We ACK
+      // EVERY HistoryEnd, write-WITH-response, echoing the 8-byte token verbatim
+      // (see buildBatchAck) — this is what walks the cursor so the band does NOT
+      // re-flood the same history on the next reconnect.
       await d.flush();
       final ack = buildBatchAck(_seq.nextSync(), m.token!);
       _log('[SYNC] ACK frame='
           '${ack.map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
       d.noteBatchAcked();
       await _write(ack); // ACK and KEEP listening
+      _noteStored(); // a banked batch → schedule a (debounced) derive
     } else if (m.sub == SyncMeta.historyComplete) {
       final d = _drain;
       if (d == null) return;
+      // Backlog fully handed over (cursor is now at the live edge). Flush the tail
+      // and KEEP LISTENING — live records continue on the same subscription, and a
+      // later strap-triggered offload reuses this same controller. We do NOT ACK a
+      // HISTORY_COMPLETE (spec §4) and we do NOT switch modes.
       await d.flush();
-      _log('[SYNC] HistoryComplete — drained ${d.records} records. Done.');
-      d.onComplete();
+      d.onComplete(); // resolve any runSync() awaiter; does NOT end the listen
+      _log('[SYNC] HistoryComplete — backlog drained (${d.records} records). '
+          'Still listening for live records.');
+      _noteStored();
     }
   }
 
@@ -582,37 +672,39 @@ class BleEngine {
     }
   }
 
-  /// Full drain: INIT → receive records → ACK each batch → stop on COMPLETE,
-  /// live-edge, idle, link-down, or timeout. Returns AFTER the final flush, so the
-  /// DerivationEngine's post-drain hook fires only once everything is persisted.
+  /// Re-trigger a historical offload over the CURRENT connection (no reconnect, no
+  /// re-subscribe). Re-arms the offload controller's completion flag and re-sends
+  /// SEND_HISTORICAL_DATA so the band streams anything banked since the last
+  /// HISTORY_COMPLETE. Used when a workout ends so a live-fed session still gets its
+  /// window backfilled from flash. Stays in `listening` — no mode change.
+  Future<void> requestHistorySync() async {
+    final d = _drain;
+    if (_session?.connected != true || d == null) return;
+    d.rearm();
+    await _send(Cmd.sendHistoricalData, const [0x00]);
+  }
+
+  /// Await the CURRENT historical offload reaching HISTORY_COMPLETE (or link-down /
+  /// the safety timeout). Does NOT change the connection phase and NEVER aborts —
+  /// listening is continuous; this just lets a caller block until the band's
+  /// backlog is fully handed over (e.g. so a foreground finalize derive runs over a
+  /// complete day). The offload itself was already kicked by [_doConnect]'s INIT.
+  ///
+  /// If the offload already completed (HISTORY_COMPLETE seen before this is called),
+  /// it returns immediately. Kept named `runSync` for the existing call sites.
   Future<SyncReport> runSync(
       {Duration timeout = const Duration(seconds: 600)}) async {
     final session = _session;
-    if (session == null || !session.connected) {
-      _log('runSync: no live link — nothing to drain.');
+    final drain = _drain;
+    if (session == null || !session.connected || drain == null) {
+      _log('runSync: no live link — nothing to await.');
       return SyncReport(0, 0, false);
     }
-    final drain = _DrainController(
-      onRecord: onRecord,
-      onRecordsBatch: onRecordsBatch,
-      log: _log,
-      evaluator: DrainStopEvaluator(timeout: timeout),
-    );
-    _drain = drain;
-    _setPhase(BleConnState.syncing);
-    await sendInit();
-
-    final report = await drain.run(
+    final report = await drain.awaitComplete(
       isLinkUp: () => session.connected,
-      sendAbort: () => _send(Cmd.abortHistoricalTransmits, const [0x00]),
+      timeout: timeout,
     );
-
-    _drain = null;
-    // Restore phase based on what's still true (link may have dropped mid-drain).
-    if (session.connected) {
-      _setPhase(_liveEnabled ? BleConnState.live : BleConnState.ready);
-    }
-    _log('[SYNC] DRAIN SUMMARY: records=${report.records} '
+    _log('[SYNC] OFFLOAD SUMMARY: records=${report.records} '
         'batches=${report.batches} complete=${report.complete}');
     return report;
   }
@@ -663,10 +755,12 @@ class BleEngine {
   Future<void> buzz() =>
       _send(Cmd.runHapticsPattern, const [hapticShortPulse, 0, 0, 0, 0]);
 
-  /// Enable live foreground streams. Optical stays WRIST-GATED (0x6B only).
+  /// Enable live foreground streams (makes the band emit live R10/R11 + optical).
+  /// Optical stays WRIST-GATED (0x6B only). This sends the toggle commands but
+  /// DOES NOT change the displayed state — we stay in the single `listening` phase;
+  /// live records simply start arriving on the same subscription history uses.
   Future<void> enableLiveStreams() async {
     _liveEnabled = true;
-    if (_phase == BleConnState.ready) _setPhase(BleConnState.live);
     await _send(Cmd.toggleRealtimeHr, const [0x01]);
     await Future.delayed(const Duration(milliseconds: 100));
     await _send(Cmd.sendR10R11Realtime, const [0x01]);
@@ -692,7 +786,8 @@ class BleEngine {
     }
     _liveEnabled = false;
     state.liveHr = null;
-    if (_phase == BleConnState.live) _setPhase(BleConnState.ready);
+    // No phase change — we stay `listening`; only the live R10/R11/optical streams
+    // stop. Historical records + the heartbeat keep flowing on the same link.
     onState(state);
   }
 
@@ -716,6 +811,15 @@ class BleEngine {
     if (session == null) return;
     session.intentionalClose = intentional;
     _drain?.onLinkDown();
+    _drain = null;
+    // Fire a final derive for anything stored-but-not-yet-derived, then disarm the
+    // debounce timer so it doesn't fire into a dead connection.
+    _deriveTimer?.cancel();
+    _deriveTimer = null;
+    if (_firstPending != null) {
+      _firstPending = null;
+      onDataStored?.call();
+    }
     final device = session.device;
     await session.teardown();
     _session = null;
@@ -727,21 +831,22 @@ class BleEngine {
   }
 }
 
-/// Event-driven historical-drain controller. Owns the buffered records, the
-/// ts/counter tracking, the idle watchdog, and the completion Future. It is fed
-/// by the engine's frame handler (records + markers) and by link-down events; it
-/// completes its [run] Future on the first stop condition.
+/// Per-connection historical-offload helper. Buffers records per ACK boundary and
+/// flushes them in one transaction (raw-first, BEFORE the HISTORY_END ACK). It is
+/// armed for the whole connection (single listening mode) — it never aborts and
+/// never switches modes. It just tracks running counts and exposes an
+/// [awaitComplete] future that resolves when the band signals HISTORY_COMPLETE (or
+/// the link drops / a safety timeout elapses), so a caller can block until the
+/// backlog is fully handed over without disturbing the continuous listen.
 class _DrainController {
   final SampleSink onRecord;
   final BatchSink? onRecordsBatch;
   final void Function(String) log;
-  final DrainStopEvaluator evaluator;
 
   _DrainController({
     required this.onRecord,
     required this.onRecordsBatch,
     required this.log,
-    required this.evaluator,
   });
 
   final List<RawRecord> _raws = [];
@@ -751,41 +856,32 @@ class _DrainController {
   int batches = 0;
   bool _complete = false;
   bool _linkDown = false;
-  int _lastTsSec = 0;
-  DateTime _lastNewRecordAt = DateTime.now();
-  final DateTime _start = DateTime.now();
 
-  final Completer<SyncReport> _done = Completer<SyncReport>();
-  Timer? _poll;
-
-  void onHistoricalRecord(RawRecord raw, Sample? sample, int tsSec) {
+  void onHistoricalRecord(RawRecord raw, Sample? sample) {
     records++;
-    _lastNewRecordAt = DateTime.now();
-    if (tsSec > 0) _lastTsSec = tsSec;
     if (onRecordsBatch != null) {
       _raws.add(raw);
       _samples.add(sample);
     } else {
-      onRecord(sample, raw);
+      unawaited(onRecord(sample, raw));
     }
   }
 
   void noteBatchAcked() => batches++;
 
-  void onComplete() {
-    _complete = true;
-    // HISTORY_COMPLETE already flushed in the marker handler — finish now.
-    if (!_done.isCompleted) unawaited(_finish(DrainStop.complete));
-  }
+  /// HISTORY_COMPLETE seen — the backlog has been fully handed over. Marks the
+  /// current offload complete (for any awaiter) WITHOUT ending the listen.
+  void onComplete() => _complete = true;
 
-  void onLinkDown() {
-    // Flag it; run()'s 1s loop observes it and finishes WITHOUT sending an abort
-    // on a dead link. Safe to call before run() starts or after it finishes.
-    _linkDown = true;
-  }
+  /// Re-arm for a fresh offload over the same connection (clears the COMPLETE flag
+  /// so a new awaitComplete() blocks until the next HISTORY_COMPLETE).
+  void rearm() => _complete = false;
+
+  void onLinkDown() => _linkDown = true;
 
   /// Persist buffered records in one transaction. Snapshots the buffer so records
-  /// arriving during the await land in the next flush.
+  /// arriving during the await land in the next flush. Raw-first: this runs BEFORE
+  /// the HISTORY_END ACK so nothing the band trims is lost.
   Future<void> flush() async {
     if (onRecordsBatch == null || _raws.isEmpty) return;
     final raws = List<RawRecord>.from(_raws);
@@ -795,52 +891,37 @@ class _DrainController {
     try {
       await onRecordsBatch!(raws, samples);
     } catch (e) {
-      log('drain flush error: $e');
+      log('offload flush error: $e');
     }
   }
 
-  /// Drive the drain to completion. Polls the pure stop-evaluator every second
-  /// (the protocol is push, but the live-edge / idle / timeout conditions are
-  /// time-based). Sends ABORT_HISTORICAL on live-edge / idle exits.
-  Future<SyncReport> run({
+  /// Resolve once the current offload reaches HISTORY_COMPLETE, the link drops, or
+  /// [timeout] elapses. Pure waiting — NO abort is ever sent (cutting the offload
+  /// short is exactly what stalled the cursor). Polls the lightweight stop-evaluator
+  /// every second.
+  Future<SyncReport> awaitComplete({
     required bool Function() isLinkUp,
-    required Future<void> Function() sendAbort,
+    Duration timeout = const Duration(seconds: 600),
   }) async {
-    _poll = Timer.periodic(const Duration(seconds: 1), (_) async {
-      if (_done.isCompleted) return;
+    final evaluator = DrainStopEvaluator(timeout: timeout);
+    final start = DateTime.now();
+    final done = Completer<SyncReport>();
+    Timer.periodic(const Duration(seconds: 1), (t) {
+      if (done.isCompleted) {
+        t.cancel();
+        return;
+      }
       if (!isLinkUp()) _linkDown = true;
-      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final stop = evaluator.evaluate(
         complete: _complete,
         linkDown: _linkDown,
-        records: records,
-        lastRecordTsSec: _lastTsSec,
-        nowSec: nowSec,
-        sinceStart: DateTime.now().difference(_start),
-        sinceLastNewRecord: DateTime.now().difference(_lastNewRecordAt),
+        sinceStart: DateTime.now().difference(start),
       );
       if (stop == DrainStop.keepGoing) return;
-      // Live-edge / idle exits politely tell the band to stop transmitting.
-      if ((stop == DrainStop.liveEdge || stop == DrainStop.idle) && isLinkUp()) {
-        log('[SYNC] stop=$stop — sending ABORT_HISTORICAL.');
-        try {
-          await sendAbort();
-        } catch (_) {}
-      } else {
-        log('[SYNC] stop=$stop.');
-      }
-      await _finish(stop);
+      t.cancel();
+      log('[SYNC] await stop=$stop.');
+      done.complete(SyncReport(records, batches, stop == DrainStop.complete));
     });
-    return _done.future;
-  }
-
-  Future<void> _finish(DrainStop stop) async {
-    if (_done.isCompleted) return;
-    _poll?.cancel();
-    _poll = null;
-    // Persist anything still buffered on a non-COMPLETE exit (those paths don't
-    // get a HistoryComplete marker; COMPLETE/END already flushed).
-    await flush();
-    _done.complete(SyncReport(records, batches, stop == DrainStop.complete));
+    return done.future;
   }
 }

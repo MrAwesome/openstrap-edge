@@ -54,16 +54,19 @@ Future<bool> runHeadlessSync() async {
       onRecordsBatch: LocalDb.insertRecordsBatch,
     );
 
+    // connect() subscribes → SET_CLOCK → INIT, so the historical offload is already
+    // streaming when this returns. We then await it reaching HISTORY_COMPLETE.
     final connected = await engine.connectToRemoteId(paired.remoteId);
     if (!connected) {
       debugPrint('[bgsync] strap not reachable this cycle — will catch up next time.');
       return true;
     }
     try {
-      // Full drain (default timeout): a phone-free run/sleep can leave a large
-      // offline backlog on the band's flash. If iOS cuts the background window
-      // short, the drain persists what it got (flush-before-ACK) and the next wake
-      // resumes from the cursor — so a longer budget only helps, never hurts.
+      // Await the full backlog (default timeout): a phone-free run/sleep can leave a
+      // large offline backlog on the band's flash. We never abort — if iOS cuts the
+      // background window short, the offload persists what it got (flush-before-ACK)
+      // and the next wake resumes from the (now-advanced) cursor. No live streams
+      // (battery): connect → listen → store → ACK → derive → disconnect.
       await engine.runSync();
     } finally {
       await engine.disconnect();

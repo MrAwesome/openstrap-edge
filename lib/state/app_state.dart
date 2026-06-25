@@ -218,16 +218,21 @@ class AppState extends ChangeNotifier {
       log: _log,
       onEvent: _onLiveEvent,
       onRecordsBatch: LocalDb.insertRecordsBatch,
+      // Debounced compute trigger: with continuous listening there's no discrete
+      // "sync done", so the engine coalesces stored-record bursts and fires this
+      // once a burst goes quiet. Light pass (newest affected day) — the foreground
+      // heavy finalize still runs in openSession after the backlog fully drains.
+      onDataStored: _onDataStored,
     );
     repo = LocalRepositoryImpl(getProfileMap: () => user);
     _init();
   }
 
-  /// Compute trigger: kick the DerivationEngine after a drain/flush COMPLETES.
-  /// [heavy]=false is the bounded light pass (newest affected day) we run inside
-  /// a short background BLE wake; [heavy]=true is the foreground finalize sweep.
-  /// Best-effort + non-blocking — never throws into the BLE path. Refreshes the
-  /// UI when results land so screens re-read the fresh derived rows.
+  /// Compute trigger: kick the DerivationEngine after data is persisted.
+  /// [heavy]=false is the bounded light pass (newest affected day); [heavy]=true is
+  /// the foreground finalize sweep. Best-effort + non-blocking — never throws into
+  /// the BLE path. Refreshes the UI when results land so screens re-read the fresh
+  /// derived rows.
   Future<void> _afterDrain({bool heavy = false}) async {
     try {
       await _derive.run(_profile, heavy: heavy);
@@ -235,6 +240,16 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       _log('[derive] post-drain failed: $e');
     }
+  }
+
+  /// Debounced "new data stored" callback from the engine (continuous listening has
+  /// no discrete sync end). The engine already coalesced the burst; we run a single
+  /// LIGHT derive over the affected day(s) and refresh DB counts for the UI.
+  void _onDataStored() {
+    unawaited(() async {
+      dbCounts = await LocalDb.counts();
+      await _afterDrain(); // light pass
+    }());
   }
 
   // Live (foreground / kept-alive) event path: persist every event, then let the
@@ -376,7 +391,7 @@ class AppState extends ChangeNotifier {
   }
 
   // ── alarm + strap name (require a live connection) ──────────────────────────
-  bool get isConnected => device.connection == 'connected' || device.connection == 'syncing';
+  bool get isConnected => device.connection == 'connected';
   // Prefer a value read back from the band; else the one we last set (persisted),
   // since the band's GET_ALARM echo format isn't fully confirmed.
   int? get alarmEpoch => device.alarmEpoch ?? _savedAlarm;
@@ -459,6 +474,10 @@ class AppState extends ChangeNotifier {
     IosBleRestore.arm(paired!.remoteId);
     _log('===== SESSION START ===== raw=${dbCounts['raw']}');
     try {
+      // connect() now subscribes → SET_CLOCK → INIT, so the historical offload is
+      // ALREADY streaming the moment this returns. We just enable live streams (so
+      // the band also emits live R10/R11) and poll device info; the offload keeps
+      // running on the same subscription with no mode flip.
       if (!await engine.connectToRemoteId(paired!.remoteId)) {
         lastError = 'Could not reach your band. Is it nearby and free '
             '(official WHOOP app force-quit)?';
@@ -468,13 +487,15 @@ class AppState extends ChangeNotifier {
       await engine.getBattery();
       await engine.getStrapName(); // populate strap name + alarm for the Profile UI
       await engine.getAlarm();
-      _log('Live session active.');
+      _log('Listening (history + live).');
+      // Block until the band's backlog is fully handed over (HISTORY_COMPLETE) —
+      // does NOT abort or end the listen. Per-batch derives already fired via the
+      // debounced onDataStored; once the WHOLE backlog has landed we run the heavy
+      // foreground finalize (full sleep staging + 24-h spectra over every stale day).
       final report = await engine.runSync();
-      _log('Drained ${report.records} records in ${report.batches} batches '
-          '(${report.complete ? "complete" : "idle-stopped"}).');
+      _log('Backlog drained: ${report.records} records in ${report.batches} '
+          'batches (${report.complete ? "complete" : "stopped early"}).');
       dbCounts = await LocalDb.counts();
-      // Drain COMPLETE → derive. Foreground session: heavy finalize sweep (full
-      // sleep staging + 24-h spectra over every stale day). Non-blocking.
       unawaited(_afterDrain(heavy: true));
     } catch (e) {
       lastError = e.toString();
@@ -528,8 +549,10 @@ class AppState extends ChangeNotifier {
   Future<void> forceResync() async {
     if (!engine.isConnected) return;
     try {
+      // Re-trigger a fresh offload over the live connection (no reconnect), then
+      // wait for it to fully hand over. Live streams stay on; no mode change.
+      await engine.requestHistorySync();
       await engine.runSync();
-      await engine.enableLiveStreams();
       dbCounts = await LocalDb.counts();
       notifyListeners();
       // A just-finished workout window landed from flash → derive it (light).
@@ -547,6 +570,10 @@ class AppState extends ChangeNotifier {
   }
 
   String get status => device.connection;
+
+  /// Wall-clock of the last BLE notification received (any characteristic), for the
+  /// "last data: Xs ago" UI. `null` until the first frame this connection.
+  DateTime? get lastDataAt => engine.lastRxAt;
 
   void _setBusy(bool b) {
     busy = b;

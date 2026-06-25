@@ -96,7 +96,7 @@ void main() {
     });
   });
 
-  group('connStringFor projection', () {
+  group('connStringFor projection (single listening mode)', () {
     test('maps every phase to the legacy UI string', () {
       expect(connStringFor(BleConnState.idle), 'disconnected');
       expect(connStringFor(BleConnState.error), 'disconnected');
@@ -106,72 +106,107 @@ void main() {
       expect(connStringFor(BleConnState.subscribing), 'connecting');
       expect(connStringFor(BleConnState.settingUp), 'connecting');
       expect(connStringFor(BleConnState.reconnecting), 'connecting');
-      expect(connStringFor(BleConnState.ready), 'connected');
-      expect(connStringFor(BleConnState.live), 'connected');
-      expect(connStringFor(BleConnState.syncing), 'syncing');
+      // The collapsed single mode — history + live both stream under 'connected'.
+      expect(connStringFor(BleConnState.listening), 'connected');
+    });
+
+    test('there is no longer a separate "syncing" string', () {
+      for (final s in BleConnState.values) {
+        expect(connStringFor(s), isNot('syncing'));
+      }
     });
   });
 
-  group('DrainStopEvaluator stop conditions', () {
-    const e = DrainStopEvaluator(
-      liveEdgeWindow: Duration(seconds: 15),
-      idleTimeout: Duration(seconds: 8),
-      timeout: Duration(seconds: 600),
-    );
-    final now = 1_700_000_000; // arbitrary epoch sec
+  group('DrainStopEvaluator stop conditions (no liveEdge/idle abort)', () {
+    const e = DrainStopEvaluator(timeout: Duration(seconds: 600));
 
     DrainStop ev({
       bool complete = false,
       bool linkDown = false,
-      int records = 0,
-      int lastTs = 0,
       int sinceStartS = 1,
-      int sinceNewS = 0,
     }) =>
         e.evaluate(
           complete: complete,
           linkDown: linkDown,
-          records: records,
-          lastRecordTsSec: lastTs,
-          nowSec: now,
           sinceStart: Duration(seconds: sinceStartS),
-          sinceLastNewRecord: Duration(seconds: sinceNewS),
         );
 
+    test('keeps going while the offload is still streaming', () {
+      // The KEY behaviour change: a still-running offload never stops on its own —
+      // only HISTORY_COMPLETE / link-down / the safety timeout end it. This is what
+      // lets the band reach HISTORY_COMPLETE and durably advance its read cursor
+      // (the old liveEdge/idle ABORT stalled the cursor → Groundhog-Day re-flood).
+      expect(ev(sinceStartS: 30), DrainStop.keepGoing);
+      expect(ev(sinceStartS: 300), DrainStop.keepGoing);
+    });
+
     test('complete wins over everything', () {
-      expect(ev(complete: true, linkDown: true, records: 10), DrainStop.complete);
+      expect(ev(complete: true, linkDown: true), DrainStop.complete);
+      expect(ev(complete: true, sinceStartS: 700), DrainStop.complete);
     });
 
-    test('link-down stops immediately (before idle/timeout budget)', () {
-      expect(ev(linkDown: true, records: 5, sinceNewS: 1), DrainStop.linkDown);
+    test('link-down stops immediately', () {
+      expect(ev(linkDown: true, sinceStartS: 1), DrainStop.linkDown);
     });
 
-    test('keeps going while records still flowing and not at live edge', () {
-      // newest record is 100s behind now → not live edge; only 2s since last new.
+    test('timeout fires only after the (generous) safety budget', () {
+      expect(ev(sinceStartS: 599), DrainStop.keepGoing);
+      expect(ev(sinceStartS: 601), DrainStop.timeout);
+    });
+
+    test('no liveEdge / idle stop reasons exist anymore', () {
+      final names = DrainStop.values.map((v) => v.name).toSet();
+      expect(names, isNot(contains('liveEdge')));
+      expect(names, isNot(contains('idle')));
+      expect(names, {'keepGoing', 'complete', 'linkDown', 'timeout'});
+    });
+  });
+
+  group('DeriveDebouncer coalesce logic', () {
+    const d = DeriveDebouncer(
+      quietPeriod: Duration(seconds: 12),
+      maxWait: Duration(seconds: 90),
+    );
+
+    test('never derives with nothing pending', () {
       expect(
-          ev(records: 50, lastTs: now - 100, sinceNewS: 2), DrainStop.keepGoing);
+          d.shouldDerive(
+            hasPending: false,
+            sinceLastRecord: const Duration(seconds: 30),
+            sinceFirstPending: const Duration(seconds: 30),
+          ),
+          isFalse);
     });
 
-    test('live-edge: newest record within window of now', () {
-      expect(ev(records: 50, lastTs: now - 5, sinceNewS: 1), DrainStop.liveEdge);
-    });
-
-    test('idle: records seen but none new for >= idleTimeout', () {
-      expect(ev(records: 50, lastTs: now - 100, sinceNewS: 9), DrainStop.idle);
-    });
-
-    test('idle: zero records and start older than idleTimeout', () {
-      expect(ev(records: 0, sinceStartS: 9), DrainStop.idle);
-    });
-
-    test('timeout fires after the overall budget regardless', () {
-      expect(ev(records: 50, lastTs: now - 100, sinceStartS: 601),
-          DrainStop.timeout);
-    });
-
-    test('complete takes priority over link-down AND timeout', () {
+    test('holds while records are still arriving (not yet quiet)', () {
       expect(
-          ev(complete: true, linkDown: true, sinceStartS: 700), DrainStop.complete);
+          d.shouldDerive(
+            hasPending: true,
+            sinceLastRecord: const Duration(seconds: 3),
+            sinceFirstPending: const Duration(seconds: 5),
+          ),
+          isFalse);
+    });
+
+    test('fires once the inbound stream goes quiet', () {
+      expect(
+          d.shouldDerive(
+            hasPending: true,
+            sinceLastRecord: const Duration(seconds: 12),
+            sinceFirstPending: const Duration(seconds: 20),
+          ),
+          isTrue);
+    });
+
+    test('never-quiet stream still derives at the maxWait floor', () {
+      // Records keep landing (only 2s quiet) but the dirty run is 90s old → derive.
+      expect(
+          d.shouldDerive(
+            hasPending: true,
+            sinceLastRecord: const Duration(seconds: 2),
+            sinceFirstPending: const Duration(seconds: 90),
+          ),
+          isTrue);
     });
   });
 }
