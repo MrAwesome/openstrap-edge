@@ -211,6 +211,10 @@ class DerivationEngine {
         'ln_rmssd': sc('ln_rmssd'),
         'resp_rate': sc('resp_rate'),
         'skin_temp_z': sc('skin_temp_z'),
+        // RAW nightly ADC mean — the baseline series for skin_temp_z. Written
+        // EVERY day (even during the bootstrap window where skin_temp_z is null)
+        // so the baseline fills and z begins computing from ~day 4.
+        'skin_temp_adc': sc('skin_temp_adc'),
         'dip_pct': sc('dip_pct'),
         'trimp': sc('trimp'),
         'odi_per_hour': sc('odi_per_hour'),
@@ -246,7 +250,11 @@ class DerivationEngine {
     m['ln_rmssd_history'] = await hist('ln_rmssd');
     m['rhr_history'] = await hist('rhr');
     m['resp_history'] = await hist('resp_rate');
-    m['skin_temp_z_history'] = await hist('skin_temp_z');
+    // BASELINE for skin_temp_z is the RAW nightly ADC-mean series (`skin_temp_adc`),
+    // NOT the z-score series. Feeding z-scores back as the baseline was a unit
+    // mismatch that left z permanently null. The raw mean is stored every day so
+    // this series fills and z starts computing once ≥3 days exist.
+    m['skin_temp_adc_history'] = await hist('skin_temp_adc');
     return m;
   }
 

@@ -60,7 +60,12 @@ class DayBundleInput {
   final List<double> lnRmssdHistory;
   final List<double> rhrHistory;
   final List<double> respHistory;
-  final List<double> skinTempZHistory;
+
+  /// Trailing RAW nightly skin-temp ADC means (NOT z-scores). The personal
+  /// baseline for the relative skin-temp deviation: today's mean sleep-window
+  /// ADC is z-scored against THIS series. Must be raw ADC means so the unit
+  /// matches today's raw mean (the old z-vs-z series was a unit mismatch bug).
+  final List<double> skinTempAdcHistory;
 
   // ── day confidence + flags (e.g. LOW_CONFIDENCE_RECOVERY for fallback days) ─
   final double dayConfidence;
@@ -85,7 +90,7 @@ class DayBundleInput {
     this.lnRmssdHistory = const [],
     this.rhrHistory = const [],
     this.respHistory = const [],
-    this.skinTempZHistory = const [],
+    this.skinTempAdcHistory = const [],
     this.dayConfidence = 0,
     this.dayFlags = const [],
   });
@@ -109,7 +114,7 @@ class DayBundleInput {
         'ln_rmssd_history': lnRmssdHistory,
         'rhr_history': rhrHistory,
         'resp_history': respHistory,
-        'skin_temp_z_history': skinTempZHistory,
+        'skin_temp_adc_history': skinTempAdcHistory,
         'day_confidence': dayConfidence,
         'day_flags': dayFlags,
       };
@@ -140,7 +145,7 @@ class DayBundleInput {
       lnRmssdHistory: dbls('ln_rmssd_history'),
       rhrHistory: dbls('rhr_history'),
       respHistory: dbls('resp_history'),
-      skinTempZHistory: dbls('skin_temp_z_history'),
+      skinTempAdcHistory: dbls('skin_temp_adc_history'),
       dayConfidence: (m['day_confidence'] as num?)?.toDouble() ?? 0,
       dayFlags: strs('day_flags'),
     );
@@ -223,14 +228,22 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
           tier: Tier.relative, inputs_used: ['spo2_red_raw', 'spo2_ir_raw']);
 
   // ── WELLNESS: relative skin-temp deviation (z) vs personal baseline ────────
-  double? skinTempZ;
+  // STEP 1 — today's RAW mean sleep-window skin-temp ADC. ALWAYS computable when
+  // there's sleep + temp data; stored EVERY day to build the baseline series so
+  // z starts computing once ≥3 prior days exist (honest bootstrap: first ~3 days
+  // legitimately read "—", then it works).
   final tempValid =
       d.sleepSkinTemp.where((v) => v > 0).map((v) => v.toDouble()).toList();
-  if (tempValid.length >= 60 && d.skinTempZHistory.length >= 3) {
-    final m = _mean(tempValid)!;
-    final base = _mean(d.skinTempZHistory)!;
-    final sd = _stddev(d.skinTempZHistory);
-    if (sd != null && sd > 0) skinTempZ = (m - base) / sd;
+  final double? skinTempAdc =
+      tempValid.length >= 60 ? _mean(tempValid) : null;
+  // STEP 2 — z-score today's RAW mean against the RAW-ADC baseline history (NOT
+  // the previously-computed z-scores; that unit mismatch was the bug). Gated on
+  // ≥3 prior raw means.
+  double? skinTempZ;
+  if (skinTempAdc != null && d.skinTempAdcHistory.length >= 3) {
+    final base = _mean(d.skinTempAdcHistory)!;
+    final sd = _stddev(d.skinTempAdcHistory);
+    if (sd != null && sd > 0) skinTempZ = (skinTempAdc - base) / sd;
   }
 
   // ── READINESS (the canonical composite, baseline-dependent) ───────────────
@@ -244,7 +257,10 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
     hrvInput(lnToday, d.lnRmssdHistory),
     rhrInput(rhrToday, d.rhrHistory),
     respInput(respToday, d.respHistory),
-    tempInput(skinTempZ, d.skinTempZHistory),
+    // Feed the RAW ADC mean + the RAW-ADC baseline so the composite computes its
+    // own oriented robust-z internally (consistent with the other inputs, which
+    // pass raw values + their raw baselines).
+    tempInput(skinTempAdc, d.skinTempAdcHistory),
   ]);
   // Plews lnRMSSD readiness over the trailing history INCLUDING today.
   final lnHist = [...d.lnRmssdHistory, ?lnToday];
@@ -389,6 +405,11 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
       'ln_rmssd': lnToday,
       'resp_rate': respToday,
       'skin_temp_z': skinTempZ,
+      // RAW nightly skin-temp ADC mean — the personal BASELINE series for
+      // skin_temp_z. ALWAYS present when there's sleep+temp data (even while z is
+      // still null in the ≤3-day bootstrap), so the series fills and z starts
+      // computing from ~day 4. This is the series _attachHistory must feed back.
+      'skin_temp_adc': skinTempAdc,
       'sdnn': hrvT.present ? hrvT.value!.sdnn : null,
       'dip_pct': dip.present ? dip.value!.dipPct : null,
       'trimp': trimp.present ? trimp.value : null,
