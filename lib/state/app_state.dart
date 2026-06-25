@@ -243,6 +243,30 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// True while a user-initiated full re-analysis is running (drives the button's
+  /// spinner). Separate from the engine's internal coalescing flag.
+  bool reanalyzing = false;
+
+  /// User-initiated "Re-analyze data": force-derive EVERY day that has raw,
+  /// ignoring the derived cursor, then refresh the UI. Returns the number of days
+  /// derived (for a result message). Use when screens are empty despite stored raw.
+  Future<int> reanalyzeAll() async {
+    if (reanalyzing) return 0;
+    reanalyzing = true;
+    notifyListeners();
+    try {
+      final n = await _derive.run(_profile, heavy: true, force: true);
+      dbCounts = await LocalDb.counts();
+      return n;
+    } catch (e) {
+      _log('[derive] reanalyze failed: $e');
+      return 0;
+    } finally {
+      reanalyzing = false;
+      notifyListeners(); // screens re-read the derived store
+    }
+  }
+
   /// Debounced "new data stored" callback from the engine (continuous listening has
   /// no discrete sync end). The engine already coalesced the burst; we run a single
   /// LIGHT derive over the affected day(s) and refresh DB counts for the UI.

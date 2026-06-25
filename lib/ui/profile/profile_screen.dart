@@ -144,6 +144,28 @@ class ProfileScreen extends StatelessWidget {
             ),
           ),
 
+          // ── Data ─────────────────────────────────────────────────────
+          const SectionHeader('Data'),
+          ProCard(
+            padding: const EdgeInsets.symmetric(
+                horizontal: Sp.x5, vertical: Sp.x2),
+            child: DetailRow(
+              icon: Ic.history,
+              label: 'Re-analyze data',
+              value: app.reanalyzing ? 'Working…' : 'Run',
+              onTap: () async {
+                if (app.reanalyzing) return;
+                final messenger = ScaffoldMessenger.of(context);
+                final n = await app.reanalyzeAll();
+                messenger.showSnackBar(SnackBar(
+                  content: Text(n > 0
+                      ? 'Analyzed $n day${n == 1 ? '' : 's'} of stored data.'
+                      : 'No raw data to analyze yet.'),
+                ));
+              },
+            ),
+          ),
+
           const SizedBox(height: Sp.x7),
 
           // ── Units (local display preference) ─────────────────────────

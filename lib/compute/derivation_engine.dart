@@ -47,26 +47,32 @@ class DerivationEngine {
 
   /// Run a derivation pass. [heavy]=false runs a bounded light pass (only the
   /// most-recent affected day) suitable for a short background BLE wake;
-  /// [heavy]=true sweeps every stale day (the nightly scheduled pass). Re-entrant
-  /// calls are coalesced (returns immediately if one is already running).
-  Future<void> run(Profile profile, {bool heavy = false}) async {
-    if (_running) return;
+  /// [heavy]=true sweeps every stale day (the nightly scheduled pass).
+  /// [force]=true re-derives EVERY day that has raw, ignoring the derived
+  /// cursor — the user-initiated "re-analyze all data" path. Re-entrant calls
+  /// are coalesced. Returns the number of days derived.
+  Future<int> run(Profile profile, {bool heavy = false, bool force = false}) async {
+    if (_running) return 0;
     _running = true;
     try {
-      final stale = await _staleDays();
+      final stale = await _staleDays(force: force);
       if (stale.isEmpty) {
-        _log('derive: nothing stale');
-        return;
+        _log('derive: nothing to do');
+        return 0;
       }
-      // Light pass: only the newest stale day (capture-window-sized work).
-      final days = heavy ? stale : stale.sublist(stale.length - 1);
-      _log('derive: ${days.length} day(s) (${heavy ? "heavy" : "light"})');
+      // Light pass: only the newest affected day (capture-window-sized work).
+      // Heavy/force: every affected day.
+      final days = (heavy || force) ? stale : stale.sublist(stale.length - 1);
+      _log('derive: ${days.length} day(s) '
+          '(${force ? "force-all" : heavy ? "heavy" : "light"})');
       for (final day in days) {
         await _deriveDay(day, profile);
       }
       await _pruneOldRaw();
+      return days.length;
     } catch (e, st) {
       _log('derive ERROR: $e\n$st');
+      return 0;
     } finally {
       _running = false;
     }
@@ -76,7 +82,8 @@ class DerivationEngine {
 
   /// Physiological-day labels (sorted ascending) that have raw newer than their
   /// derived `last_raw_ts` (or were never derived / are an old bundle version).
-  Future<List<String>> _staleDays() async {
+  /// [force]=true returns EVERY day that has raw, ignoring the derived cursor.
+  Future<List<String>> _staleDays({bool force = false}) async {
     final earliest = await LocalDb.earliestRawCapturedAt();
     final latest = await LocalDb.latestRawCapturedAt();
     if (earliest == null || latest == null) return const [];
@@ -102,6 +109,10 @@ class DerivationEngine {
 
     final stale = <String>[];
     for (final e in dayMax.entries) {
+      if (force) {
+        stale.add(e.key);
+        continue;
+      }
       final derivedTs = lastRawByDay[e.key];
       if (derivedTs == null || e.value > derivedTs) {
         stale.add(e.key);
