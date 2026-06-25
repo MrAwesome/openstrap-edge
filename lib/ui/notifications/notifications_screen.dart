@@ -32,7 +32,7 @@ class _NotificationsScreenState extends State<NotificationsScreen> {
   Future<void> _load() async {
     final api = context.read<AppState>().repo;
     if (api == null) {
-      setState(() { _phase = _Phase.error; _error = 'Not signed in.'; });
+      setState(() { _phase = _Phase.error; _error = 'Pair your strap first.'; });
       return;
     }
     setState(() { _phase = _Phase.loading; _error = null; });

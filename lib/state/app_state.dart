@@ -250,9 +250,106 @@ class AppState extends ChangeNotifier {
         },
       );
       notifyListeners(); // screens re-fetch from the derived store
+      // A heavy finalize is where a freshly-closed sleep window + recovery for a
+      // new physiological day lands — fire the "recovery ready" push off it.
+      if (heavy) unawaited(_maybeNotifyRecoveryReady());
     } catch (e) {
       _log('[derive] post-drain failed: $e');
     }
+  }
+
+  /// Local push when a NEW physiological day's recovery lands (sleep window
+  /// closed + recovery computed). Best-effort; fires at most once per day_id —
+  /// the last-notified day is persisted so a relaunch/re-derive never re-fires.
+  ///
+  /// This is the user-need cadence hook from the derive-completion path: you
+  /// wake into a new day and your recovery is ready.
+  static const String _kLastRecoveryNotifDay = 'last_recovery_notif_day';
+  Future<void> _maybeNotifyRecoveryReady() async {
+    try {
+      final row = await LocalDb.latestDayResult();
+      if (row == null) return;
+      final dayId = (row['day_id'] ?? row['date'])?.toString();
+      if (dayId == null || dayId.isEmpty) return;
+      final score = (row['readiness'] as num?)?.round();
+      if (score == null) return; // recovery not computed (no nocturnal HRV) → no fire
+
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getString(_kLastRecoveryNotifDay) == dayId) return; // already fired
+
+      // Sleep hours from the day's bundle accounting (tst), for the body copy.
+      String slept = '';
+      try {
+        final payload = jsonDecode((row['payload_json'] ?? '{}').toString());
+        if (payload is Map) {
+          final acct = ((payload['sleep'] as Map?)?['accounting'] as Map?);
+          final tstSec = ((acct?['value'] as Map?)?['tst_sec'] as num?)?.toDouble();
+          if (tstSec != null && tstSec > 0) {
+            final m = (tstSec / 60).round();
+            slept = ', slept ${m ~/ 60}h ${m % 60}m';
+          }
+        }
+      } catch (_) {/* body just omits the slept-for clause */}
+
+      await prefs.setString(_kLastRecoveryNotifDay, dayId);
+      await NotificationService.instance.showInsight(
+        id: NotificationService.idRecoveryReady,
+        title: 'Your recovery is ready',
+        body: 'Recovery $score$slept. Tap to see today.',
+      );
+      _log('[notify] recovery-ready fired for $dayId (score=$score)');
+    } catch (e) {
+      _log('[notify] recovery-ready skipped: $e');
+    }
+  }
+
+  /// Time-of-day cadence nudges (evening wind-down, weekly recap). Simple checks
+  /// run on app foreground: each fires at most once per its period, gated by a
+  /// persisted "last fired" stamp. Honest about platform limits — these fire when
+  /// the app is alive around the target time, not via a guaranteed OS timer.
+  /// Each notification carries its "why" in the body.
+  static const String _kLastWindDownDay = 'last_winddown_day';
+  static const String _kLastRecapWeek = 'last_weekly_recap_week';
+  Future<void> runCadenceChecks() async {
+    try {
+      if (!isPaired) return;
+      final now = DateTime.now();
+      final prefs = await SharedPreferences.getInstance();
+      final today = '${now.year}-${now.month}-${now.day}';
+
+      // Evening wind-down — once/day, in the 20:00–23:00 window.
+      if (now.hour >= 20 && now.hour < 23 &&
+          prefs.getString(_kLastWindDownDay) != today) {
+        await prefs.setString(_kLastWindDownDay, today);
+        await NotificationService.instance.showInsight(
+          id: NotificationService.idWindDown,
+          title: 'Time to wind down',
+          body: 'A consistent bedtime steadies your recovery — start easing off '
+              'screens and lights now.',
+        );
+      }
+
+      // Weekly recap — once/week (ISO week key), Sunday evening onward.
+      final week = '${now.year}-w${_isoWeek(now)}';
+      if (now.weekday == DateTime.sunday && now.hour >= 18 &&
+          prefs.getString(_kLastRecapWeek) != week) {
+        await prefs.setString(_kLastRecapWeek, week);
+        await NotificationService.instance.showInsight(
+          id: NotificationService.idWeeklyRecap,
+          title: 'Your week in review',
+          body: 'A new weekly recap is ready — see how your sleep, strain and '
+              'recovery trended.',
+        );
+      }
+    } catch (e) {
+      _log('[notify] cadence checks skipped: $e');
+    }
+  }
+
+  static int _isoWeek(DateTime d) {
+    final dayOfYear =
+        DateTime(d.year, d.month, d.day).difference(DateTime(d.year, 1, 1)).inDays + 1;
+    return (dayOfYear - d.weekday + 10) ~/ 7;
   }
 
   /// True while a user-initiated full re-analysis is running (drives the button's

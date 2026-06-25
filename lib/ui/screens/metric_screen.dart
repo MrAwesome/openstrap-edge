@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../state/app_state.dart';
+import '../../state/prefs.dart';
 import '../../theme/theme.dart';
 import '../../theme/tokens.dart';
 import '../kit/kit.dart';
@@ -46,7 +47,10 @@ class MetricScreen extends StatefulWidget {
 }
 
 class _MetricScreenState extends State<MetricScreen> {
-  int _tab = 0;
+  // Restore the per-metric range toggle (Today/Week/Month/3M) — Sleep, Heart,
+  // Body etc. each remember their own scale independently across launches.
+  late int _tab =
+      Prefs.getInt(Prefs.metricTab(widget.metric), 0).clamp(0, _tabs.length - 1);
   int _refresh = 0; // bumped on pull-to-refresh → woven into child keys to force re-fetch
 
   // Pull-to-refresh: remount the visible child (today detail or the drill bars) so it
@@ -87,7 +91,10 @@ class _MetricScreenState extends State<MetricScreen> {
             const SizedBox(height: Sp.x4),
             Align(
               alignment: Alignment.centerLeft,
-              child: SegToggle(options: _tabs, index: _tab, onChanged: (i) => setState(() => _tab = i)),
+              child: SegToggle(options: _tabs, index: _tab, onChanged: (i) {
+                setState(() => _tab = i);
+                Prefs.setInt(Prefs.metricTab(widget.metric), i);
+              }),
             ),
             const SizedBox(height: Sp.x5),
             if (_tab == 0)

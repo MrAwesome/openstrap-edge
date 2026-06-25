@@ -124,8 +124,8 @@ class _CycleScreenState extends State<CycleScreen> {
               _topBar(),
               const SizedBox(height: Sp.x6),
               if (_noApi)
-                _stateCard('Sign in to track your cycle',
-                    'Your cycle log syncs with your account. Sign in to log periods and see predictions.')
+                _stateCard('Cycle tracking unavailable',
+                    'Pair your strap to log periods and see predictions. Everything stays on this phone.')
               else if (_loading)
                 const Padding(padding: EdgeInsets.all(Sp.x8), child: Center(child: CircularProgressIndicator()))
               else if (_error != null)

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import 'state/app_state.dart';
+import 'state/prefs.dart';
 import 'theme/theme.dart';
 import 'theme/theme_controller.dart';
 import 'theme/theme_switcher.dart';
@@ -47,6 +48,7 @@ class _OpenStrapAppState extends State<OpenStrapApp> with WidgetsBindingObserver
     if (state == AppLifecycleState.resumed) {
       app.maybeFinishFromLiveActivity();
       app.refreshAppStatus(); // re-check OTA + admin banner on every foreground
+      app.runCadenceChecks(); // evening wind-down / weekly recap nudges (best-effort)
       if (app.isPaired) app.openSession();
     } else if (state == AppLifecycleState.paused) {
       // Backgrounded: hand the band to the iOS restore path so it can wake-and-drain
@@ -110,8 +112,10 @@ class _Shell extends StatefulWidget {
 }
 
 class _ShellState extends State<_Shell> {
-  final _controller = PageController();
-  int _index = 0;
+  // Restore the last-selected tab so a relaunch lands where the user left off.
+  late int _index =
+      Prefs.getInt(Prefs.shellTab, 0).clamp(0, _nav.length - 1);
+  late final _controller = PageController(initialPage: _index);
 
   // Built fresh on every build (not const) so a theme flip re-colours every tab,
   // even the kept-alive ones the user isn't currently looking at.
@@ -151,7 +155,10 @@ class _ShellState extends State<_Shell> {
       extendBody: true,
       body: PageView(
         controller: _controller,
-        onPageChanged: (i) => setState(() => _index = i),
+        onPageChanged: (i) {
+          setState(() => _index = i);
+          Prefs.setInt(Prefs.shellTab, i);
+        },
         children: [for (final p in _pages) _KeepAlive(child: p)],
       ),
       bottomNavigationBar: Column(mainAxisSize: MainAxisSize.min, children: [

@@ -228,7 +228,7 @@ class _AiCoachScreenState extends State<AiCoachScreen> {
             child: !cfg.configured
                 ? _setupPrompt()
                 : !signedIn
-                    ? _centered('Sign in to use the coach.')
+                    ? _centered('Pair your strap to use the coach.')
                     : _items.isEmpty
                         ? _starterView()
                         : _transcript(),
@@ -284,7 +284,7 @@ class _AiCoachScreenState extends State<AiCoachScreen> {
           const SizedBox(height: Sp.x4),
           Text('Ask me anything about your health', style: AppText.h2),
           const SizedBox(height: Sp.x2),
-          Text('I can read every metric in your account and chart it.', style: AppText.captionMuted),
+          Text('I can read every metric in your data and chart it.', style: AppText.captionMuted),
           const SizedBox(height: Sp.x5),
           for (final s in _starters)
             Padding(

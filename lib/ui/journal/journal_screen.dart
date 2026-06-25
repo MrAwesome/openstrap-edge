@@ -164,10 +164,10 @@ class _JournalScreenState extends State<JournalScreen> {
               if (_noApi)
                 _stateCard(
                   icon: Ic.profile,
-                  title: 'Sign in to journal',
+                  title: 'Journal unavailable',
                   message:
-                      'Your journal syncs with your account. Sign in to log '
-                      'tags and unlock insights from your own data.',
+                      'Pair your strap to log tags and unlock insights from '
+                      'your own data.',
                 )
               else if (_loading)
                 ..._skeleton()

@@ -48,7 +48,6 @@ class Ic {
   static const server = HugeIcons.strokeRoundedServerStack01;
   static const cloud = HugeIcons.strokeRoundedCloudServer;
   static const shield = HugeIcons.strokeRoundedShieldEnergy;
-  static const mail = HugeIcons.strokeRoundedMail01;
   static const info = HugeIcons.strokeRoundedInformationCircle;
   static const check = HugeIcons.strokeRoundedCheckmarkCircle02;
   static const cancel = HugeIcons.strokeRoundedCancel01;

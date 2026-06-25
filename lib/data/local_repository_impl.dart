@@ -890,6 +890,10 @@ class LocalRepositoryImpl extends LocalRepository {
           {
             'id': r['id'],
             'kind': r['kind'],
+            // Map the stored kind → the category/priority the feed UI styles by
+            // (icon + colour). Without this every tile renders as a grey default.
+            'category': _notifCategory(r['kind']?.toString() ?? ''),
+            'priority': _notifPriority(r['kind']?.toString() ?? ''),
             'title': r['title'],
             'body': r['body'],
             'date': r['date'],
@@ -898,6 +902,41 @@ class LocalRepositoryImpl extends LocalRepository {
           }
       ],
     };
+  }
+
+  // kind → feed category (drives the tile icon in notifications_screen.dart).
+  static String _notifCategory(String kind) {
+    switch (kind) {
+      case 'recovery':
+      case 'readiness':
+        return 'recovery';
+      case 'sleep':
+        return 'sleep';
+      case 'illness':
+      case 'temp':
+      case 'anomaly':
+        return 'health';
+      case 'load':
+        return 'load';
+      default:
+        return kind;
+    }
+  }
+
+  // kind → priority (drives the tile accent colour; 3=bad, 2=warn, 1=coral).
+  static int _notifPriority(String kind) {
+    switch (kind) {
+      case 'illness':
+        return 3;
+      case 'temp':
+      case 'anomaly':
+      case 'readiness':
+        return 2;
+      case 'recovery':
+        return 1;
+      default:
+        return 1;
+    }
   }
 
   @override

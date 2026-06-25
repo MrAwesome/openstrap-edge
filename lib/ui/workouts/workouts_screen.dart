@@ -7,6 +7,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../state/app_state.dart';
+import '../../state/prefs.dart';
 import '../activity/live_session_screen.dart';
 import '../../theme/theme.dart';
 import '../../theme/theme_switcher.dart';
@@ -139,7 +140,9 @@ class WorkoutsScreen extends StatefulWidget {
 }
 
 class _WorkoutsScreenState extends State<WorkoutsScreen> {
-  int _range = 0;
+  // Restore the last-selected timeframe (Today/Week/Month/3M) across launches.
+  late int _range =
+      Prefs.getInt(Prefs.workoutsRange, 0).clamp(0, _ranges.length - 1);
   Map<String, dynamic>? _data;
   bool _loading = true;
 
@@ -192,7 +195,7 @@ class _WorkoutsScreenState extends State<WorkoutsScreen> {
               const SizedBox(height: Sp.x4),
               Align(
                 alignment: Alignment.centerLeft,
-                child: SegToggle(options: _ranges, index: _range, onChanged: (i) { setState(() => _range = i); _load(); }),
+                child: SegToggle(options: _ranges, index: _range, onChanged: (i) { setState(() => _range = i); Prefs.setInt(Prefs.workoutsRange, i); _load(); }),
               ),
               const SizedBox(height: Sp.x4),
               if (_loading)

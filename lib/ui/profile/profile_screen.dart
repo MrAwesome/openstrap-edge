@@ -43,7 +43,6 @@ class ProfileScreen extends StatelessWidget {
     final units = context.watch<UnitsController>();
     final user = app.user ?? const {};
     final name = (user['name'] ?? '').toString().trim();
-    final email = (user['email'] ?? '').toString().trim();
 
     return SafeArea(
       bottom: false,
@@ -52,7 +51,6 @@ class ProfileScreen extends StatelessWidget {
         children: [
           _Header(
             name: name.isEmpty ? 'Your profile' : name,
-            email: email,
             onEdit: () => _editProfileSheet(context, app),
           ),
           const SizedBox(height: Sp.x8),
@@ -107,12 +105,6 @@ class ProfileScreen extends StatelessWidget {
                       ? units.weight(user['weight_kg'] as num?)
                       : 'Add',
                   onTap: () => _editProfileSheet(context, app),
-                ),
-                const _HairDivider(),
-                DetailRow(
-                  icon: Ic.mail,
-                  label: 'Email',
-                  value: email.isEmpty ? '—' : email,
                 ),
               ],
             ),
@@ -356,14 +348,14 @@ class ProfileScreen extends StatelessWidget {
 
           const SizedBox(height: Sp.x7),
 
-          // ── Account ──────────────────────────────────────────────────
-          const SectionHeader('Account'),
+          // ── Reset ────────────────────────────────────────────────────
+          const SectionHeader('Reset'),
           ProCard(
             padding: const EdgeInsets.symmetric(
                 horizontal: Sp.x5, vertical: Sp.x1),
             child: DetailRow(
               icon: Ic.logout,
-              label: 'Sign out',
+              label: 'Reset profile',
               value: '',
               onTap: () => _confirmSignOut(context, app),
               trailing: AppIcon(Ic.arrowRight,
@@ -424,9 +416,10 @@ class ProfileScreen extends StatelessWidget {
   Future<void> _confirmSignOut(BuildContext context, AppState app) async {
     final ok = await _confirm(
       context,
-      title: 'Sign out?',
-      body: 'Your local upload queue is kept and resumes after you sign back in.',
-      confirmLabel: 'Sign out',
+      title: 'Reset profile?',
+      body: 'Clears your local profile (name, age, body metrics) and forgets your '
+          'strap. Your stored band data stays on this phone.',
+      confirmLabel: 'Reset',
       destructive: true,
     );
     if (ok == true) await app.signOut();
@@ -469,10 +462,8 @@ Future<bool?> _confirm(
 // ── Header ──────────────────────────────────────────────────────────────────
 class _Header extends StatelessWidget {
   final String name;
-  final String email;
   final VoidCallback onEdit;
-  const _Header(
-      {required this.name, required this.email, required this.onEdit});
+  const _Header({required this.name, required this.onEdit});
 
   @override
   Widget build(BuildContext context) {
@@ -486,13 +477,6 @@ class _Header extends StatelessWidget {
                   style: AppText.h1,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis),
-              if (email.isNotEmpty) ...[
-                const SizedBox(height: 2),
-                Text(email,
-                    style: AppText.bodySoft,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis),
-              ],
             ],
           ),
         ),
@@ -852,8 +836,8 @@ class _DeviceSheet extends StatelessWidget {
       context,
       title: 'Forget this device?',
       body:
-          'You\'ll need to re-pair your strap to sync again. Uploaded data stays '
-          'on your server.',
+          'You\'ll need to re-pair your strap to sync again. Your stored data '
+          'stays on this phone.',
       confirmLabel: 'Forget',
       destructive: true,
     );
@@ -931,7 +915,6 @@ class _ProfileEditSheetState extends State<_ProfileEditSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final email = (widget.app.user?['email'] ?? '').toString();
     return _SheetShell(
       title: 'Edit profile',
       children: [
@@ -989,12 +972,6 @@ class _ProfileEditSheetState extends State<_ProfileEditSheet> {
         ),
         const SizedBox(height: Sp.x2),
         Text('Improves your calorie estimate.', style: AppText.captionMuted),
-        const SizedBox(height: Sp.x3),
-        Text(
-            email.isEmpty
-                ? 'Email is locked to your account.'
-                : 'Email ($email) is locked to your account.',
-            style: AppText.captionMuted),
         const SizedBox(height: Sp.x5),
         SizedBox(
           width: double.infinity,

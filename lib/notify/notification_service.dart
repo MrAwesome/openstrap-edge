@@ -37,9 +37,22 @@ class NotificationService {
     importance: Importance.high,
   );
 
-  /// Reserved for a future server/push (FCM) layer. Declared here so it can never
-  /// be accidentally reused for device alerts; that layer creates it when added.
+  /// Insights channel — locally-generated, derive-driven nudges (recovery ready,
+  /// wind-down, weekly recap). Disjoint from device alerts so the two never share
+  /// a channel or an id range.
+  static const AndroidNotificationChannel _insightsChannel =
+      AndroidNotificationChannel(
+    'insights',
+    'Insights',
+    description: 'Recovery, sleep and weekly summaries from your own data',
+    importance: Importance.defaultImportance,
+  );
   static const String insightsChannelId = 'insights';
+
+  // Stable insight notification ids (≥ kServerIdBase; never collide w/ device).
+  static const int idRecoveryReady = 2001;
+  static const int idWindDown = 2002;
+  static const int idWeeklyRecap = 2003;
 
   // ── Notification id space (never reuse an id across sources) ─────────────────
   static const int idLowBattery = 1001;
@@ -67,10 +80,10 @@ class NotificationService {
     await _plugin.initialize(
       const InitializationSettings(android: android, iOS: darwin),
     );
-    await _plugin
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(_deviceChannel);
+    final androidImpl = _plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    await androidImpl?.createNotificationChannel(_deviceChannel);
+    await androidImpl?.createNotificationChannel(_insightsChannel);
     _inited = true;
   }
 
@@ -123,6 +136,35 @@ class NotificationService {
         ),
       );
     } catch (_) {/* notifications are best-effort — never break the app */}
+  }
+
+  /// Present a locally-generated INSIGHT notification (recovery ready, wind-down,
+  /// weekly recap). Lives on its own channel + id range. Never throws.
+  Future<void> showInsight({
+    required int id,
+    required String title,
+    required String body,
+  }) async {
+    try {
+      final ok = await ensurePermission();
+      if (!ok) return;
+      await _plugin.show(
+        id,
+        title,
+        body,
+        NotificationDetails(
+          android: AndroidNotificationDetails(
+            _insightsChannel.id,
+            _insightsChannel.name,
+            channelDescription: _insightsChannel.description,
+            importance: Importance.defaultImportance,
+            priority: Priority.defaultPriority,
+            icon: '@mipmap/ic_launcher',
+          ),
+          iOS: const DarwinNotificationDetails(),
+        ),
+      );
+    } catch (_) {/* best-effort */}
   }
 
   Future<void> cancel(int id) async {

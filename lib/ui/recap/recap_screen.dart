@@ -13,6 +13,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../data/local_repository.dart';
 import '../../state/app_state.dart';
+import '../../state/prefs.dart';
 import '../../theme/theme.dart';
 import '../../theme/tokens.dart';
 import '../kit/kit.dart';
@@ -29,7 +30,8 @@ enum _Phase { loading, ready, empty, error }
 class _RecapScreenState extends State<RecapScreen> {
   final GlobalKey _cardKey = GlobalKey();
 
-  String _range = '7d'; // '7d' | '30d'
+  // Restore the last-selected recap range ('7d' | '30d') across launches.
+  String _range = Prefs.getString(Prefs.recapRange, '7d') == '30d' ? '30d' : '7d';
   _Phase _phase = _Phase.loading;
   String? _error;
   Map<String, dynamic> _data = const {};
@@ -46,7 +48,7 @@ class _RecapScreenState extends State<RecapScreen> {
     if (api == null) {
       setState(() {
         _phase = _Phase.error;
-        _error = 'Not signed in.';
+        _error = 'Pair your strap first.';
       });
       return;
     }
@@ -81,6 +83,7 @@ class _RecapScreenState extends State<RecapScreen> {
     final next = i == 0 ? '7d' : '30d';
     if (next == _range) return;
     _range = next;
+    Prefs.setString(Prefs.recapRange, next);
     _load();
   }
 

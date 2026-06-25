@@ -8,6 +8,7 @@ import 'compute/background_derivation.dart';
 import 'notify/notification_service.dart';
 import 'coach/coach_config.dart';
 import 'state/app_state.dart';
+import 'state/prefs.dart';
 import 'state/units_controller.dart';
 import 'theme/theme_controller.dart';
 import 'widget/widget_service.dart';
@@ -37,6 +38,9 @@ Future<void> main() async {
   // Schedule the heavy nightly derivation (Android WorkManager; iOS no-op — see
   // the honest caveat in background_derivation.dart). Best-effort.
   await _safeInit('BackgroundDerivation', BackgroundDerivation.init);
+  // Cache SharedPreferences so UI screens can synchronously RESTORE saved
+  // selections (tab, range toggles) in initState with no async flash.
+  await _safeInit('Prefs', Prefs.ensureLoaded);
 
   // Resolve appearance (persisted choice + OS brightness) BEFORE the first frame
   // so login/signup already paint in the right mode (Ember on Paper / Char).

@@ -127,12 +127,7 @@ class _TodayScreenState extends State<TodayScreen>
             if (phase == LoadPhase.loading)
               ..._skeleton()
             else if (phase == LoadPhase.empty)
-              _empty(
-                title: 'Wear + sync to see today',
-                message:
-                    'Put your strap on and keep the app open. Your daily metrics '
-                    'appear after the next sync and analytics run.',
-              )
+              _emptyOrProcessing(app)
             else if (phase == LoadPhase.error)
               _empty(
                 title: "Couldn't load today",
@@ -623,6 +618,70 @@ class _TodayScreenState extends State<TodayScreen>
   }
 
   // ── states ───────────────────────────────────────────────────────────────────
+
+  /// Honest empty/processing state. Three cases, never a blank-with-no-reason:
+  ///   • analysis running  → "Processing… N/M days" with a spinner.
+  ///   • raw collected, not yet derived → invite to analyze now (shows record count).
+  ///   • truly no data      → "Wear + sync to see today".
+  Widget _emptyOrProcessing(AppState app) {
+    final raw = app.dbCounts['raw'] ?? 0;
+    if (app.reanalyzing) {
+      return _processing(app.reanalyzeProgress.isEmpty
+          ? 'Analyzing your stored data…'
+          : '${app.reanalyzeProgress.replaceFirst('Analyzing', 'Processing')} days');
+    }
+    if (raw > 0) {
+      return _processingPrompt(app, raw);
+    }
+    return _empty(
+      title: 'Wear + sync to see today',
+      message:
+          'Put your strap on and keep the app open. Your daily metrics '
+          'appear after the next sync and analytics run.',
+    );
+  }
+
+  Widget _processing(String label) => ProCard(
+        padding: const EdgeInsets.all(Sp.x6),
+        child: Column(children: [
+          SizedBox(
+              width: 30,
+              height: 30,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2.5, color: AppColors.coral)),
+          const SizedBox(height: Sp.x4),
+          Text('Processing your data', style: AppText.h2, textAlign: TextAlign.center),
+          const SizedBox(height: Sp.x2),
+          Text(label, style: AppText.bodySoft, textAlign: TextAlign.center),
+        ]),
+      );
+
+  Widget _processingPrompt(AppState app, int raw) => ProCard(
+        padding: const EdgeInsets.all(Sp.x6),
+        child: Column(children: [
+          Container(
+            padding: const EdgeInsets.all(Sp.x4),
+            decoration: BoxDecoration(
+                color: AppColors.coralSoft, shape: BoxShape.circle),
+            child: AppIcon(Ic.history, size: 30, color: AppColors.coralDeep),
+          ),
+          const SizedBox(height: Sp.x4),
+          Text('Data collected — not analyzed yet',
+              style: AppText.h2, textAlign: TextAlign.center),
+          const SizedBox(height: Sp.x2),
+          Text(
+            'Stored $raw raw record${raw == 1 ? '' : 's'} from your strap. '
+            'Analysis runs automatically after a sync — or run it now.',
+            style: AppText.bodySoft,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: Sp.x5),
+          FilledButton(
+            onPressed: () => app.reanalyzeAll(),
+            child: const Text('Analyze now'),
+          ),
+        ]),
+      );
 
   Widget _empty({required String title, required String message}) {
     return ProCard(
