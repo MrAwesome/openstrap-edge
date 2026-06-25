@@ -34,7 +34,10 @@ import 'profile.dart';
 import 'substrate.dart';
 
 /// Analytics/bundle version — bump to force a recompute of non-finalized days.
-const int kAlgoVersion = 2;
+/// v3: Walch 2019 stager + 4-class stages (light/deep/rem), robust nocturnal HRV,
+/// 0–21 strain, skin-temp-z baseline fix, baseline-need signals. Bumping this
+/// retires stale v2 bundles so the new metrics actually surface on next derive.
+const int kAlgoVersion = 3;
 
 /// Raw is kept this many days past derivation, then pruned (derived stays).
 const int rawRetentionDays = 14;
