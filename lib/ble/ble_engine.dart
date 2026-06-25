@@ -61,6 +61,13 @@ typedef BatchSink = Future<void> Function(
 /// trigger now that listening is continuous and there's no discrete sync end.
 typedef DataStoredSink = void Function();
 
+/// Fired for every LIVE high-rate frame (0x28/0x2B/0x33). These are EPHEMERAL —
+/// they are NOT persisted to raw_records (that bloated storage ~50x and stalled
+/// derivation). The caller routes them to an in-memory sink for the live UI /
+/// spot-check / workout feature-extraction. `recTs` is the frame's decoded real
+/// device time (epoch sec), or null if undecodable.
+typedef LiveFrameSink = void Function(int packetType, String hex, int? recTs);
+
 class SyncReport {
   final int records;
   final int batches;
@@ -121,6 +128,11 @@ class BleEngine {
   /// their own derive).
   final DataStoredSink? onDataStored;
 
+  /// If provided, LIVE high-rate frames (0x28/0x2B/0x33) are routed here instead
+  /// of being persisted. Ephemeral — for the live UI / spot-check / workout
+  /// feature-extraction. NEVER hits raw_records.
+  final LiveFrameSink? onLiveFrame;
+
   /// Tunable debounce window for [onDataStored]. Default coalesces a burst once the
   /// stream goes quiet for ~12s, with a 90s never-quiet floor.
   final DeriveDebouncer deriveDebouncer;
@@ -132,6 +144,7 @@ class BleEngine {
     this.onEvent,
     this.onRecordsBatch,
     this.onDataStored,
+    this.onLiveFrame,
     this.deriveDebouncer = const DeriveDebouncer(),
   });
 
@@ -518,25 +531,21 @@ class BleEngine {
       return;
     }
     // LIVE streams: realtime HR/RR (0x28), realtime R10 (0x2B), IMU (0x33).
-    // Raw-first — store; the backend/on-device layer field-decodes. Never touch
-    // the historical-sync bookkeeping (which keys off 0x2F only).
+    // EPHEMERAL — these are the high-rate flood (~655 MB/day) and the daily
+    // metrics need ONLY the 1 Hz historical substrate (0x2F / R24). We do NOT
+    // persist them to raw_records; instead we route them to the in-memory live
+    // sink (live UI / spot-check / workout feature-extraction). We also do NOT
+    // arm the derive debounce (nothing was stored). Never touch the
+    // historical-sync bookkeeping (which keys off 0x2F only).
     if (pt == PacketType.realtimeData ||
         pt == PacketType.realtimeRawData ||
         pt == PacketType.realtimeImuStream) {
       final liveHex = _innerHex(frame.inner);
-      // rec_ts = the frame's REAL device time (epoch sec) so derivation buckets by
-      // real day, not receive time. Decode cheaply here; LocalDb falls back to
-      // captured_at/1000 if this stays null.
+      // recTs = the frame's REAL device time (epoch sec) — cheap decode, for the
+      // ephemeral sink (e.g. spot-check buffering). Null if undecodable.
       final liveTs = decodeRecord(liveHex)?.ts;
-      final raw = RawRecord(
-        counter: _counterFromInner(frame.inner),
-        packetType: pt,
-        hex: liveHex,
-        capturedAt: DateTime.now().millisecondsSinceEpoch,
-        recTs: (liveTs != null && liveTs > 0) ? liveTs : null,
-      );
-      unawaited(_storeRecord(null, raw)); // store + arm the derive debounce
-      // Fall through to decodeFrame so the UI gets live telemetry.
+      onLiveFrame?.call(pt, liveHex, (liveTs != null && liveTs > 0) ? liveTs : null);
+      // Fall through to decodeFrame so the UI gets live telemetry (state.liveHr).
     }
     if (pt == PacketType.historicalData) {
       final recType = frame.inner.length > 1 ? frame.inner[1] : -1;

@@ -78,8 +78,18 @@ class LocalDb {
           // sessions, and the notifications feed — all on-device, additive.
           await _createUserTables(db);
         }
+        if (oldV < 8) {
+          // RE-KEY raw_records by `counter` (drop the hex PRIMARY KEY, which
+          // roughly DOUBLED on-disk size). LIVE high-rate frames are no longer
+          // persisted at all — only the 1 Hz historical substrate (0x2F / R24),
+          // which always carries a real u32 counter, lands here. A clean rebuild
+          // is acceptable: raw is re-drainable from the band's flash, and this
+          // instantly reclaims the prior live-stream bloat.
+          await db.execute('DROP TABLE IF EXISTS raw_records');
+          await _createRaw(db);
+        }
       },
-      version: 7,
+      version: 8,
     );
   }
 
@@ -192,14 +202,17 @@ class LocalDb {
     ''');
   }
 
-  // raw_records — keyed by the full frame hex (unique; dedupes identical
-  // historical re-drains AND coexists with counter-less live packets).
+  // raw_records — keyed by the band's per-record u32 `counter` (the natural
+  // idempotency key; re-draining the same flash region inserts nothing new). Only
+  // the 1 Hz historical substrate (0x2F / R24) is persisted here — LIVE high-rate
+  // frames are ephemeral (routed to an in-memory sink, never stored). Keying by
+  // counter instead of the full hex string roughly HALVES on-disk size.
   static Future<void> _createRaw(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS raw_records (
-        hex TEXT PRIMARY KEY,
+        counter INTEGER PRIMARY KEY,
+        hex TEXT NOT NULL,
         packet_type INTEGER,
-        counter INTEGER,
         captured_at INTEGER NOT NULL,
         rec_ts INTEGER NOT NULL DEFAULT 0,
         uploaded INTEGER NOT NULL DEFAULT 0

@@ -224,6 +224,9 @@ class AppState extends ChangeNotifier {
       // once a burst goes quiet. Light pass (newest affected day) — the foreground
       // heavy finalize still runs in openSession after the backlog fully drains.
       onDataStored: _onDataStored,
+      // LIVE high-rate frames (0x28/0x2B/0x33) are ephemeral — routed here for the
+      // live UI / spot-check, NEVER persisted to raw_records.
+      onLiveFrame: _onLiveFrame,
     );
     repo = LocalRepositoryImpl(getProfileMap: () => user);
     _init();
@@ -380,13 +383,19 @@ class AppState extends ChangeNotifier {
     await IosBleRestore.arm(paired!.remoteId);
   }
 
+  // Historical singles only now (live frames go through _onLiveFrame and are
+  // never persisted). Just write the raw record (+ optional decoded sample).
   Future<void> _onRecord(Sample? sample, RawRecord raw) async {
-    // Spot-check: tap the live RR-bearing frames (0x28 compact HR, 0x2B R10) into
-    // the in-memory scan buffer. Cheap-bounded; cleared at each scan start.
-    if (spotActive && (raw.packetType == 0x28 || raw.packetType == 0x2B)) {
-      if (_spotFrames.length < 8000) _spotFrames.add(raw.hex);
-    }
     await LocalDb.insertRecord(raw, sample);
+  }
+
+  // Ephemeral live high-rate frame (0x28/0x2B/0x33) — NOT persisted. Spot-check
+  // taps the RR-bearing frames (0x28 compact HR, 0x2B R10) into the in-memory
+  // scan buffer. Cheap-bounded; cleared at each scan start.
+  void _onLiveFrame(int pt, String hex, int? recTs) {
+    if (spotActive && (pt == 0x28 || pt == 0x2B)) {
+      if (_spotFrames.length < 8000) _spotFrames.add(hex);
+    }
   }
 
   void _onEngineState(DeviceState s) {
