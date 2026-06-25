@@ -7,6 +7,7 @@
 // `counter` (u32 @[3:7]) is the band's per-record id and our natural idempotency
 // key — re-draining the same flash region inserts nothing new (INSERT OR IGNORE).
 
+import 'package:openstrap_protocol/openstrap_protocol.dart' as proto;
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import 'models.dart';
@@ -55,8 +56,20 @@ class LocalDb {
           // Purely additive — raw tables are untouched.
           await _createDerived(db);
         }
+        if (oldV < 6) {
+          // BUCKET-BY-REAL-TIME fix. Add `rec_ts` (epoch SECONDS, the decoded
+          // record time) to raw_records and backfill it for every existing row by
+          // decoding the stored hex once. The DerivationEngine now buckets days by
+          // rec_ts (not captured_at), so a multi-day flash backfill received in one
+          // sync no longer collapses into a single "today" bucket. Additive + safe
+          // on a populated DB.
+          await _addRecTsColumn(db);
+          await _backfillRecTs(db);
+          await db.execute(
+              'CREATE INDEX IF NOT EXISTS idx_raw_rects ON raw_records(rec_ts)');
+        }
       },
-      version: 5,
+      version: 6,
     );
   }
 
@@ -126,11 +139,59 @@ class LocalDb {
         packet_type INTEGER,
         counter INTEGER,
         captured_at INTEGER NOT NULL,
+        rec_ts INTEGER NOT NULL DEFAULT 0,
         uploaded INTEGER NOT NULL DEFAULT 0
       )
     ''');
     await db.execute(
         'CREATE INDEX IF NOT EXISTS idx_raw_unuploaded ON raw_records(uploaded, captured_at) WHERE uploaded = 0');
+    // rec_ts is the bucketing/window key for the DerivationEngine.
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_raw_rects ON raw_records(rec_ts)');
+  }
+
+  /// Add the additive `rec_ts` column to an EXISTING raw_records table (upgrade
+  /// path only). NOT NULL with a DEFAULT 0 so legacy rows are well-formed until
+  /// the backfill rewrites them.
+  static Future<void> _addRecTsColumn(Database db) async {
+    await db.execute(
+        'ALTER TABLE raw_records ADD COLUMN rec_ts INTEGER NOT NULL DEFAULT 0');
+  }
+
+  /// Backfill `rec_ts` for every existing raw row by decoding its hex once. Runs
+  /// inside the migration on a populated DB. Falls back to captured_at/1000 when a
+  /// frame is undecodable or yields a non-positive ts — rec_ts is never left at 0.
+  static Future<void> _backfillRecTs(Database db) async {
+    final rows = await db.query('raw_records',
+        columns: ['hex', 'captured_at'], where: 'rec_ts = 0 OR rec_ts IS NULL');
+    if (rows.isEmpty) return;
+    final batch = db.batch();
+    for (final r in rows) {
+      final hex = r['hex'] as String;
+      final capturedSec = ((r['captured_at'] as int?) ?? 0) ~/ 1000;
+      final ts = decodeRecTs(hex, fallbackSec: capturedSec);
+      batch.update('raw_records', {'rec_ts': ts},
+          where: 'hex = ?', whereArgs: [hex]);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// Decode a frame's REAL record timestamp (epoch seconds) from its inner hex.
+  /// Cheap (reads the ts field only via the protocol decoders). Returns
+  /// [fallbackSec] when undecodable or the decoded ts is non-positive — so callers
+  /// never store a 0/negative rec_ts. Used at insert and during the v6 backfill.
+  static int decodeRecTs(String hex, {required int fallbackSec}) {
+    // Historical type-24 carries the canonical ts; decodeRecord covers 0x28/R10/R24.
+    try {
+      final s = proto.decodeRecord(hex);
+      if (s != null && s.ts > 0) return s.ts;
+    } catch (_) {/* fall through */}
+    // RR-bearing live frames (0x28) as a secondary path.
+    try {
+      final rr = proto.realtimeRr(hex);
+      if (rr != null && rr.ts > 0) return rr.ts;
+    } catch (_) {/* fall through */}
+    return fallbackSec;
   }
 
   // Events (wrist on/off, charging, battery, double-tap, …) — live OR from sync.
@@ -176,6 +237,14 @@ class LocalDb {
   /// Store a raw record (+ optional decoded sample). Idempotent on frame hex.
   /// Raw is written FIRST (raw-first invariant). Returns true if newly inserted.
   /// LIVE packets pass sample=null — the backend field-decodes them from raw.
+  /// Resolve the rec_ts (epoch sec) to store: reuse the already-decoded value from
+  /// [raw] (ble_engine sets it from the record it parsed) to avoid a double-decode,
+  /// else decode the hex here, else fall back to captured_at/1000.
+  static int _recTsFor(RawRecord raw) {
+    if (raw.recTs != null && raw.recTs! > 0) return raw.recTs!;
+    return decodeRecTs(raw.hex, fallbackSec: raw.capturedAt ~/ 1000);
+  }
+
   static Future<bool> insertRecord(RawRecord raw, Sample? sample) async {
     final db = await instance;
     int rawRows = 0;
@@ -187,6 +256,7 @@ class LocalDb {
           'packet_type': raw.packetType,
           'counter': raw.counter,
           'captured_at': raw.capturedAt,
+          'rec_ts': _recTsFor(raw),
           'uploaded': raw.uploaded ? 1 : 0,
         },
         conflictAlgorithm: ConflictAlgorithm.ignore,
@@ -221,6 +291,7 @@ class LocalDb {
             'packet_type': raw.packetType,
             'counter': raw.counter,
             'captured_at': raw.capturedAt,
+            'rec_ts': _recTsFor(raw),
             'uploaded': raw.uploaded ? 1 : 0,
           },
           conflictAlgorithm: ConflictAlgorithm.ignore,
@@ -248,6 +319,7 @@ class LocalDb {
               packetType: (m['packet_type'] as int?) ?? 0,
               hex: m['hex'] as String,
               capturedAt: m['captured_at'] as int,
+              recTs: (m['rec_ts'] as int?),
               uploaded: false,
             ))
         .toList();
@@ -300,6 +372,37 @@ class LocalDb {
         whereArgs: [fromMs, toMs],
         orderBy: 'captured_at ASC');
     return rows.map((m) => m['hex'] as String).toList();
+  }
+
+  /// All raw record hexes whose REAL record time (`rec_ts`, epoch SECONDS) is in
+  /// [fromSec, toSec], oldest first. This is the day-window read the engine uses so
+  /// a backfill is split by real day, not by when it was received (captured_at).
+  static Future<List<String>> rawHexInRecTsRange(int fromSec, int toSec) async {
+    final db = await instance;
+    final rows = await db.query('raw_records',
+        columns: ['hex'],
+        where: 'rec_ts >= ? AND rec_ts <= ?',
+        whereArgs: [fromSec, toSec],
+        orderBy: 'rec_ts ASC');
+    return rows.map((m) => m['hex'] as String).toList();
+  }
+
+  /// `{localDayLabel -> MAX(rec_ts)}` over all raw, grouped by the LOCAL calendar
+  /// day of the record's real time. The engine compares each day's max rec_ts
+  /// against its derived cursor to decide what needs (re)derivation.
+  static Future<Map<String, int>> rawRecTsMaxByDay() async {
+    final db = await instance;
+    final rows = await db.rawQuery(
+      "SELECT strftime('%Y-%m-%d', rec_ts, 'unixepoch', 'localtime') AS d, "
+      'MAX(rec_ts) AS mx FROM raw_records GROUP BY d',
+    );
+    final out = <String, int>{};
+    for (final r in rows) {
+      final d = r['d'] as String?;
+      final mx = (r['mx'] as num?)?.toInt();
+      if (d != null && mx != null) out[d] = mx;
+    }
+    return out;
   }
 
   /// The newest `captured_at` (epoch ms) across all raw — used to find days with

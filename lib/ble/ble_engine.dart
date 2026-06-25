@@ -523,11 +523,17 @@ class BleEngine {
     if (pt == PacketType.realtimeData ||
         pt == PacketType.realtimeRawData ||
         pt == PacketType.realtimeImuStream) {
+      final liveHex = _innerHex(frame.inner);
+      // rec_ts = the frame's REAL device time (epoch sec) so derivation buckets by
+      // real day, not receive time. Decode cheaply here; LocalDb falls back to
+      // captured_at/1000 if this stays null.
+      final liveTs = decodeRecord(liveHex)?.ts;
       final raw = RawRecord(
         counter: _counterFromInner(frame.inner),
         packetType: pt,
-        hex: _innerHex(frame.inner),
+        hex: liveHex,
         capturedAt: DateTime.now().millisecondsSinceEpoch,
+        recTs: (liveTs != null && liveTs > 0) ? liveTs : null,
       );
       unawaited(_storeRecord(null, raw)); // store + arm the derive debounce
       // Fall through to decodeFrame so the UI gets live telemetry.
@@ -535,12 +541,10 @@ class BleEngine {
     if (pt == PacketType.historicalData) {
       final recType = frame.inner.length > 1 ? frame.inner[1] : -1;
       final counter = _counterFromInner(frame.inner);
-      final raw = RawRecord(
-        counter: counter,
-        packetType: pt,
-        hex: _innerHex(frame.inner),
-        capturedAt: DateTime.now().millisecondsSinceEpoch,
-      );
+      // Decode the record FIRST so we can stamp its REAL time onto rec_ts. The
+      // DerivationEngine buckets/windows days by rec_ts, so a multi-day flash
+      // backfill (all received in one sync) splits into correct per-real-day
+      // buckets instead of collapsing into one "today".
       Sample? sample;
       if (recType == Record.r24) {
         final r = parseR24(frame.inner);
@@ -553,6 +557,13 @@ class BleEngine {
           sample = Sample(tsEpoch: r.tsEpoch, counter: r.counter, hr: r.hr);
         }
       }
+      final raw = RawRecord(
+        counter: counter,
+        packetType: pt,
+        hex: _innerHex(frame.inner),
+        capturedAt: DateTime.now().millisecondsSinceEpoch,
+        recTs: (sample != null && sample.tsEpoch > 0) ? sample.tsEpoch : null,
+      );
       // Hand the record to the offload controller (it buffers per-batch until the
       // HISTORY_END flush, which persists raw-first BEFORE we ACK). The controller
       // is armed for the whole connection, so this is always present; the fallback

@@ -35,8 +35,14 @@ class RawRecord {
   final int counter; // u32 @[3:7] for header records; 0 for counter-less live packets
   final int packetType; // inner[0]: 0x2F historical, 0x2B/0x28/0x33 live
   final String hex; // full inner bytes, hex — the idempotency key
-  final int capturedAt; // epoch ms we received it
+  final int capturedAt; // epoch ms we received it (STORAGE age — used for pruning)
   final bool uploaded;
+  // The record's REAL device timestamp, epoch SECONDS. This — not capturedAt —
+  // is what the DerivationEngine buckets/windows days by, so a multi-day flash
+  // backfill (all received in one sync, one capturedAt≈now) still splits into the
+  // correct per-real-day buckets. Null here means "decode at insert / fall back to
+  // capturedAt/1000"; the DB column is always non-null.
+  final int? recTs;
 
   RawRecord({
     required this.counter,
@@ -44,6 +50,7 @@ class RawRecord {
     required this.hex,
     required this.capturedAt,
     this.uploaded = false,
+    this.recTs,
   });
 }
 
