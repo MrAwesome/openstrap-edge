@@ -552,20 +552,18 @@ class LocalDb {
     return db.query('derived_day', orderBy: 'date DESC', limit: limit);
   }
 
-  /// Copy the live SQLite DB to a temp file for export/sharing. Folds the WAL
-  /// into the main file first so the copy is a complete, consistent snapshot
-  /// (raw_records + derived_day + baselines + everything). Returns the path.
+  /// Write a consistent, compacted snapshot of the DB to a temp file for export.
+  /// Uses `VACUUM INTO` (NOT a raw file copy) so the snapshot is transactionally
+  /// consistent — a plain copy of a live SQLite file can produce torn pages
+  /// (a corrupt export). VACUUM INTO also defragments, so the file is small.
   static Future<String> exportCopy() async {
     final db = await instance;
-    try {
-      await db.execute('PRAGMA wal_checkpoint(TRUNCATE)');
-    } catch (_) {/* best-effort */}
-    final dir = await getDatabasesPath();
-    final src = p.join(dir, 'openstrap.db');
     final tmp = await getTemporaryDirectory();
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final dest = p.join(tmp.path, 'openstrap_export_$stamp.db');
-    await File(src).copy(dest);
+    final f = File(dest);
+    if (await f.exists()) await f.delete(); // VACUUM INTO requires a fresh path
+    await db.execute('VACUUM INTO ?', [dest]);
     return dest;
   }
 
