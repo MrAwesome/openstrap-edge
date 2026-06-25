@@ -35,6 +35,11 @@ import AVFoundation
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ActionBridge") {
       ActionBridge.register(messenger: registrar.messenger())
     }
+    // AccessorySetupKit pairing bridge (iOS 18+). The ASK picker provisions the WHOOP so
+    // iOS 26 keeps the app eligible for background relaunch (TN3115). No-op pre-iOS 18.
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "AccessorySetup") {
+      AccessorySetup.register(messenger: registrar.messenger())
+    }
     // Build-time iOS configuration exposed to Dart without requiring --dart-define.
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ConfigBridge") {
       ConfigBridge.register(messenger: registrar.messenger())

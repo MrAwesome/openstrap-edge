@@ -21,6 +21,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_status.dart';
+import '../ble/accessory_setup.dart';
 import '../ble/ble_engine.dart';
 import '../ble/ios_ble_restore.dart';
 import '../compute/derivation_engine.dart';
@@ -369,8 +370,26 @@ class AppState extends ChangeNotifier {
   // ── pairing (LOCAL only) ────────────────────────────────────────────────────
   Future<BluetoothDevice?> scanForBand() => engine.scan();
 
+  /// True on iOS 18+, where pairing must go through the AccessorySetupKit picker so
+  /// the band is provisioned for iOS-26 background relaunch (TN3115). False on Android
+  /// and iOS < 18 — those use the service-filtered scan flow ([scanForBand]/[pairWith]).
+  Future<bool> accessorySetupSupported() => AccessorySetup.isSupported();
+
+  /// iOS 18+ pairing: show the ASK picker, persist the provisioned band by its
+  /// CoreBluetooth UUID (== flutter_blue_plus remoteId), then open the session. Throws
+  /// if the user cancels or no accessory is provisioned. The picker is skipped (returns
+  /// the known id) if a WHOOP is already provisioned via ASK.
+  Future<void> pairViaAccessorySetup({String? serial}) async {
+    final remoteId = await AccessorySetup.showPicker();
+    await _persistPaired(remoteId, serial);
+  }
+
   Future<void> pairWith(BluetoothDevice d, {String? serial}) async {
-    await PairedDevice.save(d.remoteId.str, serial ?? device.serial);
+    await _persistPaired(d.remoteId.str, serial);
+  }
+
+  Future<void> _persistPaired(String remoteId, String? serial) async {
+    await PairedDevice.save(remoteId, serial ?? device.serial);
     paired = await PairedDevice.load();
     // Now that there's a band to alert about, ask for notification permission
     // (a natural moment; battery/charging alerts depend on it). Best-effort.
@@ -384,6 +403,9 @@ class AppState extends ChangeNotifier {
     IosBleRestore.foregroundActive = false;
     await EdgeTracking.stop();
     await IosBleRestore.disarm();
+    // Deprovision the ASK accessory (iOS 18+) so a future pair re-shows the picker and
+    // re-establishes iOS-26 relaunch eligibility. No-op on Android / iOS < 18.
+    await AccessorySetup.removeAll();
     await engine.disconnect();
     await PairedDevice.clear();
     paired = null;

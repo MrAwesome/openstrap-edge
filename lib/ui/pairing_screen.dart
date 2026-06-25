@@ -203,7 +203,7 @@ class _ScanStep extends StatefulWidget {
   State<_ScanStep> createState() => _ScanStepState();
 }
 
-enum _Phase { scanning, found, notFound, pairing }
+enum _Phase { scanning, found, notFound, pairing, askReady }
 
 class _ScanStepState extends State<_ScanStep> {
   _Phase _phase = _Phase.scanning;
@@ -213,11 +213,41 @@ class _ScanStepState extends State<_ScanStep> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scan());
+    // On iOS 18+ pairing goes through the AccessorySetupKit picker (which does its own
+    // discovery + selection) so the band is provisioned for iOS-26 background relaunch.
+    // On Android / iOS < 18 we use the service-filtered scan flow.
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final ask = await context.read<AppState>().accessorySetupSupported();
+      if (!mounted) return;
+      if (ask) {
+        setState(() => _phase = _Phase.askReady);
+      } else {
+        _scan();
+      }
+    });
   }
 
   String _name(BluetoothDevice d) =>
       d.platformName.isNotEmpty ? d.platformName : 'WHOOP band';
+
+  /// iOS 18+ pairing: open the ASK system picker; on selection the band is provisioned
+  /// and the gate rebuilds to the main shell.
+  Future<void> _pairViaAsk() async {
+    setState(() {
+      _phase = _Phase.pairing;
+      _error = null;
+    });
+    try {
+      await context.read<AppState>().pairViaAccessorySetup();
+      // On success the gate rebuilds to the main shell.
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _phase = _Phase.askReady;
+      });
+    }
+  }
 
   Future<void> _scan() async {
     setState(() {
@@ -278,9 +308,11 @@ class _ScanStepState extends State<_ScanStep> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  _phase == _Phase.notFound
-                      ? 'No strap found.'
-                      : 'Finding your\nstrap.',
+                  switch (_phase) {
+                    _Phase.notFound => 'No strap found.',
+                    _Phase.askReady => 'Pair your\nstrap.',
+                    _ => 'Finding your\nstrap.',
+                  },
                   style: AppText.display,
                 ),
                 const SizedBox(height: Sp.x4),
@@ -294,6 +326,9 @@ class _ScanStepState extends State<_ScanStep> {
                       'We couldn\'t find a strap. Make sure it\'s awake and in '
                           'pairing mode, then try again.',
                     _Phase.pairing => 'Pairing with your strap…',
+                    _Phase.askReady =>
+                      'Tap Pair, then choose your WHOOP in the system sheet. '
+                          'This lets OpenStrap reconnect in the background.',
                   },
                   style: AppText.bodySoft,
                 ),
@@ -325,6 +360,18 @@ class _ScanStepState extends State<_ScanStep> {
     switch (_phase) {
       case _Phase.scanning:
         return const SizedBox(height: 56);
+      case _Phase.askReady:
+        return FilledButton(
+          onPressed: _pairViaAsk,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: const [
+              Text('Pair'),
+              SizedBox(width: Sp.x2),
+              AppIcon(Ic.bluetooth, size: 20, color: Colors.white),
+            ],
+          ),
+        );
       case _Phase.found:
         return FilledButton(
           onPressed: _pair,
