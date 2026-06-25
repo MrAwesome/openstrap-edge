@@ -213,6 +213,25 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
       : Metric<CvhrResult>.absent(
           tier: Tier.estimate, inputs_used: const ['rr_cleaned']);
 
+  // Relative ODI (desaturation-event SCREEN). red/ir/ts are appended 1:1 per R24
+  // alongside HR, so they share length; guard equality defensively anyway.
+  final odiRed = [for (final v in d.spo2RedRaw) v.toDouble()];
+  final odiIr = [for (final v in d.spo2IrRaw) v.toDouble()];
+  final odiTs = [for (final v in d.hrTsSec) v.toDouble()];
+  final odi = (odiRed.length == odiIr.length &&
+          odiRed.length == odiTs.length &&
+          odiRed.length >= 60)
+      ? relativeOdi(odiRed, odiIr, odiTs)
+      : Metric<RelativeOdiResult>.absent(
+          tier: Tier.relative,
+          inputs_used: const ['spo2_red_raw', 'spo2_ir_raw']);
+
+  // Cardiopulmonary coupling (sleep-stability screen) from the cleaned NN series.
+  final cpc = nn.length >= 60
+      ? cardiopulmonaryCoupling(nn, nnTimes)
+      : Metric<CpcResult>.absent(
+          tier: Tier.high, inputs_used: const ['rr_cleaned']);
+
   // ── MOTION (ENMO + sleep position) ─────────────────────────────────────────
   final accelMags =
       accel.map((s) => math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z)).toList();
@@ -302,10 +321,12 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
     'window': sleepWin.toJson((v) => v.toJson()),
     'accounting': sleepAcct.toJson((v) => v.toJson()),
     'stager': stager.toJson((v) => v.toJson()),
+    'cpc': cpc.toJson((v) => v.toJson()),
   };
   final respiration = <String, dynamic>{
     'rsa': resp.toJson((v) => v.toJson()),
     'cvhr_apnea': cvhr.toJson((v) => v.toJson()),
+    'odi': odi.toJson((v) => v.toJson()),
   };
   final motion = <String, dynamic>{
     'enmo_coverage': enmo.coverage,
@@ -363,6 +384,8 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
       'sdnn': hrvT.present ? hrvT.value!.sdnn : null,
       'dip_pct': dip.present ? dip.value!.dipPct : null,
       'trimp': trimp.present ? trimp.value : null,
+      'odi_per_hour': odi.present ? odi.value!.odiPerHour : null,
+      'cpc_ratio': cpc.present ? cpc.value!.cpcRatio : null,
     },
   };
 }

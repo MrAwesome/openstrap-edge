@@ -244,8 +244,9 @@ class LocalRepositoryImpl extends LocalRepository {
       'cycles': acct?['cycles'],
       'onset': (win?['onset_ms'] as num?) == null ? null : ((win!['onset_ms'] as num) / 1000).round(),
       'wake': (win?['offset_ms'] as num?) == null ? null : ((win!['offset_ms'] as num) / 1000).round(),
-      'light_min': _stagePct(stager, 'nrem_pct', tst),
-      'deep_min': _stagePct(stager, 'nrem_pct', tst), // stager is wake/nrem/rem
+      'light_min': null, // no light/deep split — stager only does wake/nrem/rem
+      'deep_min': null,
+      'nrem_min': _stagePct(stager, 'nrem_pct', tst), // combined NREM (real)
       'rem_min': _stagePct(stager, 'rem_pct', tst),
       'stages': hypnogram, // [{start, end, stage}]
       'flags': {
@@ -267,7 +268,7 @@ class LocalRepositoryImpl extends LocalRepository {
     return {
       'resp': _respObj(b),
       'cvhr': _sub(b, 'respiration.cvhr_apnea'),
-      'spo2': {'value': _scalar(b, 'skin_temp_z')}, // relative; no absolute %
+      'spo2': _sub(b, 'respiration.odi'), // relative desaturation screen; never an absolute %
     };
   }
 

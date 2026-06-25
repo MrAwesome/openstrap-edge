@@ -214,6 +214,8 @@ class DerivationEngine {
         'skin_temp_z': sc('skin_temp_z'),
         'dip_pct': sc('dip_pct'),
         'trimp': sc('trimp'),
+        'odi_per_hour': sc('odi_per_hour'),
+        'cpc_ratio': sc('cpc_ratio'),
       },
     );
     await _refreshBaselines();
