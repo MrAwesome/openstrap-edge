@@ -264,7 +264,7 @@ class _SleepPeriodsScreenState extends State<SleepPeriodsScreen> {
         return AppColors.coralDeep;
       case 'light':
       case 'nrem':
-        return AppColors.loadDetraining;
+        return kLightStageColor;
       default:
         return AppColors.inkMuted;
     }

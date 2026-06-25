@@ -227,7 +227,7 @@ class _SleepDetailScreenState extends State<SleepDetailScreen> {
 
   // ── stage colors / labels ─────────────────────────────────────────────────
 
-  // Four stage colors: Awake (muted) / Light (cool blue) / Deep (deep coral) /
+  // Four stage colors: Awake (muted) / Light (light orange) / Deep (deep coral) /
   // REM (coral). 'nrem' maps to Light for any legacy combined-Core data.
   Color _stageColor(String stage) {
     switch (stage) {
@@ -239,7 +239,7 @@ class _SleepDetailScreenState extends State<SleepDetailScreen> {
         return AppColors.coralDeep;
       case 'light':
       case 'nrem': // legacy combined Core → render as Light
-        return AppColors.loadDetraining;
+        return kLightStageColor;
       default:
         return AppColors.inkMuted;
     }
@@ -322,7 +322,7 @@ class _SleepDetailScreenState extends State<SleepDetailScreen> {
       const SizedBox(height: Sp.x6),
       const SectionHeader('Trends'),
       MetricGroup([
-        TrendMetricRow(icon: Ic.moon, accent: AppColors.loadDetraining, label: 'Time asleep',
+        TrendMetricRow(icon: Ic.moon, accent: AppColors.coral, label: 'Time asleep',
             info: infoFor('sleep'), value: _hm(_durationMin), metric: 'sleep', trendTitle: 'Sleep',
             valueFmt: (v) => v == 0 ? '' : (v / 60).toStringAsFixed(1)),
         if (_efficiency != null)
@@ -330,7 +330,7 @@ class _SleepDetailScreenState extends State<SleepDetailScreen> {
               info: infoFor('efficiency'), value: '${(_efficiency! * 100).round()}', unit: '%',
               metric: 'efficiency', trendTitle: 'Sleep efficiency'),
         if (_lightMin != null)
-          TrendMetricRow(icon: Ic.pulse, accent: AppColors.loadDetraining, label: 'Light sleep',
+          TrendMetricRow(icon: Ic.pulse, accent: kLightStageColor, label: 'Light sleep',
               info: infoFor('light'), value: _hm(_lightMin), metric: 'light', trendTitle: 'Light sleep'),
         if (_deepMin != null)
           TrendMetricRow(icon: Ic.pulse, accent: AppColors.coralDeep, label: 'Deep sleep',

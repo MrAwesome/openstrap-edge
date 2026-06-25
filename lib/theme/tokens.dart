@@ -13,6 +13,11 @@
 
 import 'package:flutter/material.dart';
 
+/// Light-sleep stage colour — a soft light orange (warm, distinct from the
+/// coral REM/Deep tones; replaces the old cool-blue which clashed with the
+/// ember palette).
+const Color kLightStageColor = Color(0xFFF6B07A);
+
 /// A complete set of mode-varying colour roles. Two const instances exist
 /// ([kLightPalette], [kDarkPalette]); the active one is swapped at runtime.
 @immutable
