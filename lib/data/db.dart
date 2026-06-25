@@ -80,13 +80,23 @@ class LocalDb {
         }
         if (oldV < 8) {
           // RE-KEY raw_records by `counter` (drop the hex PRIMARY KEY, which
-          // roughly DOUBLED on-disk size). LIVE high-rate frames are no longer
-          // persisted at all — only the 1 Hz historical substrate (0x2F / R24),
-          // which always carries a real u32 counter, lands here. A clean rebuild
-          // is acceptable: raw is re-drainable from the band's flash, and this
-          // instantly reclaims the prior live-stream bloat.
-          await db.execute('DROP TABLE IF EXISTS raw_records');
+          // roughly DOUBLED on-disk size) and PURGE the live high-rate bloat
+          // (0x28/0x2B/0x33). CRITICAL: we must NOT drop the 1 Hz historical
+          // substrate (0x2F / R24) — the band will not re-send records its read
+          // cursor has already passed, and they may not be derived yet, so a
+          // blind rebuild would lose real data. Instead: rename aside, create the
+          // new counter-keyed table, migrate the historical rows across (their
+          // counters are unique), and discard only the live frames + the old
+          // hex-PK overhead.
+          await db.execute('ALTER TABLE raw_records RENAME TO _raw_old');
           await _createRaw(db);
+          await db.execute(
+            'INSERT OR IGNORE INTO raw_records '
+            '(counter, hex, packet_type, captured_at, rec_ts, uploaded) '
+            'SELECT counter, hex, packet_type, captured_at, rec_ts, uploaded '
+            'FROM _raw_old WHERE packet_type = 47 AND counter IS NOT NULL',
+          );
+          await db.execute('DROP TABLE _raw_old');
         }
       },
       version: 8,
