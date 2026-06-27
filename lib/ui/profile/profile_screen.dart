@@ -617,78 +617,65 @@ class _HealthSection extends StatelessWidget {
 
   Widget _statusRow(BuildContext context, HealthLinkState st, String store) {
     final messenger = ScaffoldMessenger.of(context);
-    switch (st) {
-      case HealthLinkState.ready:
-        return Row(children: [
-          AppIcon(Ic.check, size: 16, color: AppColors.good),
-          const SizedBox(width: Sp.x2),
-          Expanded(
-              child: Text('Connected — new days sync automatically.',
-                  style: AppText.captionMuted)),
-          TextButton(
-            onPressed: () async {
-              final n = await app.healthSyncNow();
-              messenger.showSnackBar(SnackBar(
-                  content: Text(n > 0
-                      ? 'Synced $n day${n == 1 ? '' : 's'} to $store.'
-                      : 'Already up to date.')));
-            },
-            child: const Text('Sync now'),
-          ),
-        ]);
-      case HealthLinkState.needsPermission:
-      case HealthLinkState.unknown:
-        // Tapping "Grant access" opens the platform permission flow — on Android
-        // that's the Health Connect app, where the user enables OpenStrap. The
-        // subtitle tells them what to do once it opens.
-        final subtitle = app.healthIsApple
-            ? 'When the Apple Health sheet opens, turn ON every category so '
-                'OpenStrap can write them, then come back.'
-            : 'Opens Health Connect. There, allow OpenStrap to write the data '
-                'above — App permissions → OpenStrap → Allow all — then come back.';
-        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Expanded(
-                child: Text('Grant write access to add your data to $store.',
-                    style: AppText.captionMuted)),
-            const SizedBox(width: Sp.x2),
-            FilledButton(
-              onPressed: () => app.requestHealth(),
-              style: FilledButton.styleFrom(
-                  backgroundColor: AppColors.coral,
-                  visualDensity: VisualDensity.compact),
-              child: const Text('Grant access',
-                  style: TextStyle(color: Colors.white)),
-            ),
-          ]),
-          const SizedBox(height: Sp.x2),
-          Text(subtitle,
-              style: AppText.caption.copyWith(color: AppColors.inkMuted)),
-          if (!app.healthIsApple)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                onPressed: () async {
-                  await app.openHealthConnect();
-                  await app.checkHealth(); // re-read state when they return
-                },
-                style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    visualDensity: VisualDensity.compact),
-                child: const Text('Open Health Connect'),
-              ),
-            ),
-        ]);
-      case HealthLinkState.notInstalled:
-        return _cta('$store isn’t installed. Install it, then come back.',
-            'Install', () => app.installHealthConnect());
-      case HealthLinkState.needsUpdate:
-        return _cta('$store needs an update before we can write to it.',
-            'Update', () => app.installHealthConnect());
-      case HealthLinkState.unsupported:
-        return Text('$store isn’t available on this device.',
-            style: AppText.captionMuted);
+    // Health Connect must be installed/updated first (Android).
+    if (st == HealthLinkState.notInstalled) {
+      return _cta('$store isn’t installed. Install it, then come back.',
+          'Install', () => app.installHealthConnect());
     }
+    if (st == HealthLinkState.needsUpdate) {
+      return _cta('$store needs an update before we can write to it.', 'Update',
+          () => app.installHealthConnect());
+    }
+    if (st == HealthLinkState.unsupported) {
+      return Text('$store isn’t available on this device.',
+          style: AppText.captionMuted);
+    }
+
+    // Available: we can't reliably read the per-type WRITE grant (the platform
+    // hides it), so we just keep writing and tell the user how to allow access
+    // if data isn't showing — never a stuck "Grant access" gate.
+    final subtitle = app.healthIsApple
+        ? 'New days are written automatically. If they don’t appear in Apple '
+            'Health, tap Allow access and turn ON every category.'
+        : 'New days are written automatically. If they don’t appear, open '
+            'Health Connect → App permissions → OpenStrap → Allow all.';
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        AppIcon(Ic.check, size: 16, color: AppColors.good),
+        const SizedBox(width: Sp.x2),
+        Expanded(
+            child:
+                Text('Syncing to $store.', style: AppText.captionMuted)),
+      ]),
+      const SizedBox(height: Sp.x2),
+      Text(subtitle, style: AppText.caption.copyWith(color: AppColors.inkMuted)),
+      const SizedBox(height: Sp.x2),
+      Wrap(spacing: Sp.x2, children: [
+        FilledButton(
+          onPressed: () => app.requestHealth(),
+          style: FilledButton.styleFrom(
+              backgroundColor: AppColors.coral,
+              visualDensity: VisualDensity.compact),
+          child: const Text('Allow access', style: TextStyle(color: Colors.white)),
+        ),
+        if (!app.healthIsApple)
+          OutlinedButton(
+            onPressed: () => app.openHealthConnect(),
+            style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
+            child: const Text('Open Health Connect'),
+          ),
+        TextButton(
+          onPressed: () async {
+            final n = await app.healthSyncNow();
+            messenger.showSnackBar(SnackBar(
+                content: Text(n > 0
+                    ? 'Synced $n day${n == 1 ? '' : 's'} to $store.'
+                    : 'Up to date — new days sync as they’re computed.')));
+          },
+          child: const Text('Sync now'),
+        ),
+      ]),
+    ]);
   }
 
   Widget _cta(String text, String label, VoidCallback onTap) => Row(children: [

@@ -39,7 +39,6 @@ enum HealthLinkState {
 class HealthExporter {
   final _health = Health();
   bool _configured = false;
-  final Set<HealthDataType> _granted = {};
 
   /// True on iOS/macOS (Apple Health); false on Android (Health Connect).
   static bool get isApple => Platform.isIOS || Platform.isMacOS;
@@ -61,6 +60,8 @@ class HealthExporter {
         _hrvType,
         HealthDataType.RESPIRATORY_RATE,
         HealthDataType.ACTIVE_ENERGY_BURNED,
+        HealthDataType.BASAL_ENERGY_BURNED,
+        HealthDataType.STEPS,
         HealthDataType.SLEEP_DEEP,
         HealthDataType.SLEEP_REM,
         HealthDataType.SLEEP_LIGHT,
@@ -69,13 +70,12 @@ class HealthExporter {
         HealthDataType.WORKOUT,
       ];
 
-  bool get ready =>
-      _granted.contains(HealthDataType.RESTING_HEART_RATE) ||
-      _granted.contains(HealthDataType.SLEEP_SESSION) ||
-      _granted.contains(HealthDataType.SLEEP_DEEP);
-
-  String get grantedSummary =>
-      _granted.isEmpty ? 'none' : _granted.map((t) => t.name).join(', ');
+  // We do NOT gate on a write-permission check: HealthKit hides write-auth by
+  // design, and Health Connect's hasPermissions(WRITE) frequently returns
+  // null/false even after the user grants everything — which would leave the UI
+  // stuck on "Grant access" forever. Instead we ATTEMPT every write and let the
+  // platform enforce (ungranted writes silently no-op). The only hard gate is
+  // store AVAILABILITY (Health Connect installed/updated on Android).
 
   Future<void> _ensureConfigured() async {
     if (_configured) return;
@@ -85,22 +85,6 @@ class HealthExporter {
     } catch (e) {
       debugPrint('[health] configure: $e');
     }
-  }
-
-  Future<void> _refreshGranted() async {
-    _granted.clear();
-    for (final t in _types) {
-      try {
-        if (await _health
-                .hasPermissions([t], permissions: [HealthDataAccess.WRITE]) ==
-            true) {
-          _granted.add(t);
-        }
-      } catch (e) {
-        debugPrint('[health] hasPermissions(${t.name}): $e');
-      }
-    }
-    debugPrint('[health] granted: $grantedSummary (ready=$ready)');
   }
 
   Future<HealthLinkState?> _androidUnavailable() async {
@@ -119,42 +103,33 @@ class HealthExporter {
     return null;
   }
 
-  /// CHECK existing permissions WITHOUT prompting. Startup-safe, never throws.
+  /// Store availability (no permission prompt). `ready` = installed/updated &
+  /// writable-in-principle; we can't reliably know the per-type grant, so the
+  /// app attempts writes regardless. Never throws.
   Future<HealthLinkState> check() async {
     await _ensureConfigured();
     try {
-      final un = await _androidUnavailable();
-      if (un != null) return un;
-      await _refreshGranted();
-      return ready ? HealthLinkState.ready : HealthLinkState.needsPermission;
+      return await _androidUnavailable() ?? HealthLinkState.ready;
     } catch (e) {
       debugPrint('[health] check: $e');
       return HealthLinkState.unsupported;
     }
   }
 
-  /// REQUEST write permission (system dialog). Call ONLY from a user gesture.
+  /// Open the system grant flow (HealthKit sheet / Health Connect permission UI).
+  /// Call from a user gesture. Returns availability; we never block on the
+  /// (unreliable) post-grant permission read.
   Future<HealthLinkState> request() async {
     await _ensureConfigured();
+    final un = await _androidUnavailable();
+    if (un != null) return un;
     try {
-      final un = await _androidUnavailable();
-      if (un != null) return un;
-      await _refreshGranted();
-      final missing = _types.where((t) => !_granted.contains(t)).toList();
-      if (missing.isNotEmpty) {
-        try {
-          await _health.requestAuthorization(missing,
-              permissions: missing.map((_) => HealthDataAccess.WRITE).toList());
-        } catch (e) {
-          debugPrint('[health] requestAuthorization: $e');
-        }
-        await _refreshGranted();
-      }
-      return ready ? HealthLinkState.ready : HealthLinkState.needsPermission;
+      await _health.requestAuthorization(_types,
+          permissions: _types.map((_) => HealthDataAccess.WRITE).toList());
     } catch (e) {
-      debugPrint('[health] request: $e');
-      return HealthLinkState.unsupported;
+      debugPrint('[health] requestAuthorization: $e');
     }
+    return HealthLinkState.ready;
   }
 
   /// Send the user to the Play Store to install Health Connect (Android only).
@@ -195,10 +170,8 @@ class HealthExporter {
   /// re-written on each call. [reset] re-exports the whole retained window.
   /// Returns the number of days written. Never throws.
   Future<int> exportAll({bool reset = false, void Function(int days)? onProgress}) async {
-    if (!ready) {
-      await check();
-      if (!ready) return 0;
-    }
+    await _ensureConfigured();
+    if (await _androidUnavailable() != null) return 0; // HC missing/outdated
     try {
       if (reset) await LocalDb.setCursor('health_export_through', '');
       final cursor = await LocalDb.getCursor('health_export_through') ?? '';
@@ -253,7 +226,6 @@ class HealthExporter {
     // Idempotency: remove OUR previously-written samples for this day (HealthKit /
     // Health Connect only let an app delete its own data), then re-write fresh.
     for (final t in _types) {
-      if (!_granted.contains(t)) continue;
       try {
         await _health.delete(type: t, startTime: dayStart, endTime: dayEnd);
       } catch (e) {
@@ -274,7 +246,7 @@ class HealthExporter {
 
     Future<void> writeAt(HealthDataType type, num? v, HealthDataUnit unit,
         DateTime t) async {
-      if (v == null || v <= 0 || !_granted.contains(type)) return;
+      if (v == null || v <= 0) return;
       try {
         await _health.writeHealthData(
             value: v.toDouble(),
@@ -296,8 +268,7 @@ class HealthExporter {
 
     // Active energy over the whole day.
     final cal = sc('calories');
-    if (cal != null && cal > 0 &&
-        _granted.contains(HealthDataType.ACTIVE_ENERGY_BURNED)) {
+    if (cal != null && cal > 0) {
       try {
         await _health.writeHealthData(
             value: cal.toDouble(),
@@ -310,6 +281,36 @@ class HealthExporter {
       }
     }
 
+    // Basal energy = total daily energy (TDEE) − active, over the whole day.
+    final calTotal = sc('calories_total');
+    if (calTotal != null && cal != null && calTotal > cal) {
+      try {
+        await _health.writeHealthData(
+            value: (calTotal - cal).toDouble(),
+            type: HealthDataType.BASAL_ENERGY_BURNED,
+            startTime: dayStart,
+            endTime: dayEnd,
+            unit: HealthDataUnit.KILOCALORIE);
+      } catch (e) {
+        debugPrint('[health] write basal energy: $e');
+      }
+    }
+
+    // Steps (24/7 estimate) over the whole day.
+    final steps = sc('steps');
+    if (steps != null && steps > 0) {
+      try {
+        await _health.writeHealthData(
+            value: steps.toDouble(),
+            type: HealthDataType.STEPS,
+            startTime: dayStart,
+            endTime: dayEnd,
+            unit: HealthDataUnit.COUNT);
+      } catch (e) {
+        debugPrint('[health] write steps: $e');
+      }
+    }
+
     // Sleep stages from the per-segment hypnogram (real time ranges).
     final segs = (_sub(b, 'series')?['hypnogram'] as List?) ?? const [];
     for (final s in segs) {
@@ -319,7 +320,7 @@ class HealthExporter {
       final stage = s['stage']?.toString();
       if (st == null || en == null || en <= st || stage == null) continue;
       final type = _sleepType(stage);
-      if (type == null || !_granted.contains(type)) continue;
+      if (type == null) continue;
       try {
         await _health.writeHealthData(
             value: 0,
@@ -332,7 +333,7 @@ class HealthExporter {
     }
 
     // Workouts (manual/live/detected) finalized in this calendar day.
-    if (_granted.contains(HealthDataType.WORKOUT)) {
+    {
       try {
         final rows = await LocalDb.sessionsInRange(
             dayStart.millisecondsSinceEpoch ~/ 1000,
