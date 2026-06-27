@@ -800,6 +800,76 @@ class LocalDb {
     return dest;
   }
 
+  /// Import another device's exported OpenStrap DB ([path], from [exportCopy] +
+  /// share) by MERGING its rows into this one (INSERT-OR-REPLACE). Covers derived
+  /// results, the metric series, user data, and the raw ledger so the receiving
+  /// device has the full history (and can re-derive). Same app ⇒ same schema; a
+  /// table missing in the source is skipped. Returns per-table copied counts.
+  static Future<Map<String, int>> importFromDbFile(String path) async {
+    if (!await File(path).exists()) {
+      throw const FileSystemException('Backup file not found');
+    }
+    final src = await openDatabase(path, readOnly: true);
+    final db = await instance;
+    // Order: independent tables; all use INSERT OR REPLACE so re-import is safe.
+    const tables = [
+      'raw_records',
+      'samples',
+      'events',
+      'day_result',
+      'metric_series',
+      'sessions',
+      'journal',
+      'cycle_log',
+      'notifications',
+      'baselines',
+      'sync_cursor',
+    ];
+    // Columns this app's schema actually has, per table — so a row from a NEWER
+    // export carrying extra columns this build doesn't know about is filtered
+    // down (dropped) instead of throwing "no such column". A column the source
+    // LACKS simply isn't in the map → the dest default applies. Forward- and
+    // backward-compatible across schema versions.
+    Future<Set<String>> destCols(String t) async {
+      final info = await db.rawQuery('PRAGMA table_info($t)');
+      return {for (final c in info) (c['name'] as String)};
+    }
+
+    final counts = <String, int>{};
+    try {
+      for (final t in tables) {
+        List<Map<String, Object?>> rows;
+        try {
+          rows = await src.query(t);
+        } catch (_) {
+          continue; // table absent in the source export
+        }
+        if (rows.isEmpty) {
+          counts[t] = 0;
+          continue;
+        }
+        final cols = await destCols(t);
+        if (cols.isEmpty) continue; // table absent in THIS build
+        await db.transaction((txn) async {
+          final batch = txn.batch();
+          for (final r in rows) {
+            final row = <String, Object?>{
+              for (final e in r.entries)
+                if (cols.contains(e.key)) e.key: e.value
+            };
+            if (row.isEmpty) continue;
+            batch.insert(t, row, conflictAlgorithm: ConflictAlgorithm.replace);
+          }
+          await batch.commit(noResult: true);
+        });
+        counts[t] = rows.length;
+      }
+    } finally {
+      await src.close();
+    }
+    return counts;
+  }
+
   // ── diagnostics (read-only summaries for the Diagnostics screen) ────────────
 
   /// Raw store summary: total rows, rec_ts span (real record time, sec, >0 only),

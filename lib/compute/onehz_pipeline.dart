@@ -61,6 +61,13 @@ class DayBundleInput {
   final List<double> rhrHistory;
   final List<double> respHistory;
 
+  /// Trailing robust nocturnal RMSSD means (ms) — the SAME `rmssd` series the
+  /// engine writes to metric_series (NREM-restricted, median-of-5-min). Used as
+  /// the history for the EWMA hrv baseline so its center and today's value are the
+  /// SAME metric (was previously reconstructed from ln(whole-window RMSSD), a
+  /// definition mismatch that made the z spuriously large).
+  final List<double> rmssdHistory;
+
   /// Trailing RAW nightly skin-temp ADC means (NOT z-scores). The personal
   /// baseline for the relative skin-temp deviation: today's mean sleep-window
   /// ADC is z-scored against THIS series. Must be raw ADC means so the unit
@@ -90,6 +97,7 @@ class DayBundleInput {
     this.lnRmssdHistory = const [],
     this.rhrHistory = const [],
     this.respHistory = const [],
+    this.rmssdHistory = const [],
     this.skinTempAdcHistory = const [],
     this.dayConfidence = 0,
     this.dayFlags = const [],
@@ -114,6 +122,7 @@ class DayBundleInput {
         'ln_rmssd_history': lnRmssdHistory,
         'rhr_history': rhrHistory,
         'resp_history': respHistory,
+        'rmssd_history': rmssdHistory,
         'skin_temp_adc_history': skinTempAdcHistory,
         'day_confidence': dayConfidence,
         'day_flags': dayFlags,
@@ -145,6 +154,7 @@ class DayBundleInput {
       lnRmssdHistory: dbls('ln_rmssd_history'),
       rhrHistory: dbls('rhr_history'),
       respHistory: dbls('resp_history'),
+      rmssdHistory: dbls('rmssd_history'),
       skinTempAdcHistory: dbls('skin_temp_adc_history'),
       dayConfidence: (m['day_confidence'] as num?)?.toDouble() ?? 0,
       dayFlags: strs('day_flags'),
@@ -251,14 +261,15 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
       d.sleepSkinTemp.where((v) => v > 0).map((v) => v.toDouble()).toList();
   final double? skinTempAdc =
       tempValid.length >= 60 ? _mean(tempValid) : null;
-  // STEP 2 — z-score today's RAW mean against the RAW-ADC baseline history (NOT
-  // the previously-computed z-scores; that unit mismatch was the bug). Gated on
-  // ≥3 prior raw means.
+  // STEP 2 — robust z of today's RAW mean vs the RAW-ADC baseline history via the
+  // SAME Winsorized-EWMA engine the rhr/hrv/resp baselines use (recency-weighted,
+  // hard-outlier rejecting) instead of a plain mean/SD. Gated on ≥3 prior raw
+  // means. The baseline folds history ONLY (today is the value being scored).
   double? skinTempZ;
   if (skinTempAdc != null && d.skinTempAdcHistory.length >= 3) {
-    final base = _mean(d.skinTempAdcHistory)!;
-    final sd = _stddev(d.skinTempAdcHistory);
-    if (sd != null && sd > 0) skinTempZ = (skinTempAdc - base) / sd;
+    final state = Baselines.foldHistory(
+        <double?>[for (final v in d.skinTempAdcHistory) v], _skinTempAdcCfg);
+    skinTempZ = Baselines.deviation(skinTempAdc, state).z;
   }
 
   // ── READINESS (the canonical composite, baseline-dependent) ───────────────
@@ -317,6 +328,29 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
   final rawTrimp = trimp.present ? trimp.value : null;
   final strainMetric = strainScoreMetric(rawTrimp);
 
+  // SECONDARY "EFFORT" STRAIN (0–100) — Edwards zone-sum TRIMP over the WAKE
+  // span via the Karvonen %HRR StrainScorer. Additive, alongside the 0–21
+  // headline: a finer, zone-weighted intensity read on the SAME wake HR. Runs
+  // per-SECOND (not per-minute) so the Edwards zone time-in-band is exact.
+  // Gated internally on ≥600 samples (or ≥20 spanning ≥600 s) and HRmax>RHR.
+  final wakeTs = <double>[];
+  final wakeBpm = <double>[];
+  for (var i = 0; i < d.dayHr.length; i++) {
+    if (d.dayHr[i] <= 0) continue;
+    final t = d.dayTsSec[i];
+    if (t >= d.sleepOnsetSec && t < d.sleepOffsetSec) continue; // skip sleep
+    wakeTs.add(t.toDouble());
+    wakeBpm.add(d.dayHr[i].toDouble());
+  }
+  final effort = (hrMax != null && rhrForTrimp != null)
+      ? trimpStrain(wakeBpm, wakeTs,
+          maxHr: hrMax,
+          restingHr: rhrForTrimp,
+          method: 'edwards',
+          sex: sex == 'f' ? Sex.female : Sex.male)
+      : const Metric<double>.absent(
+          tier: Tier.estimate, inputs_used: ['hr_series', 'resting_hr', 'max_hr']);
+
   // ── curve series for the UI ────────────────────────────────────────────────
   final hrCurve = _downsampleHr(d.dayTsSec, d.dayHr);
   final hypnogram = _hypnogramSegments(d);
@@ -372,6 +406,8 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
     // Headline 0–21 strain envelope; raw Banister TRIMP kept as `trimp`.
     'strain': strainMetric.toJson(),
     'trimp': trimp.toJson(),
+    // Secondary 0–100 Edwards "effort" strain (zone-weighted, per-second wake HR).
+    'strain_effort': effort.toJson(),
   };
 
   // Sleep section — ALL fields from the single SleepSegmentation. We re-emit the
@@ -533,11 +569,50 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
   // The continuous z-RMSSD wave the cycle GRAPH plots ({t: epochSec, z}).
   sleep['cycle_series'] = cyc.series;
 
+  // ── PERSONAL BASELINES (Winsorized-EWMA) ───────────────────────────────────
+  // Robust, recency-weighted personal centers + spread for the metrics whose
+  // units match the engine configs (rhr bpm, hrv RMSSD ms, resp brpm). Fold the
+  // trailing history + today's value, then z/delta/ratio + cold-start status.
+  // ADDITIVE: a richer, calibration-honest baseline block the recovery/illness
+  // layer can consume; the existing readiness/skin_temp_z headlines are untouched.
+  // skin_temp is intentionally EXCLUDED — its series is raw ADC, not the °C the
+  // skin_temp cfg bounds expect, so feeding it would hard-reject every night.
+  // Fold the trailing history ONLY (today is the value being scored, never folded
+  // into its own baseline), then report today + its deviation + the cold-start
+  // status. Status/nValid reflect the history nights.
+  Map<String, dynamic> baselineBlock(
+      List<double> history, double? today, MetricCfg cfg) {
+    final state =
+        Baselines.foldHistory(<double?>[for (final v in history) v], cfg);
+    final dev = today == null ? null : Baselines.deviation(today, state);
+    return <String, dynamic>{
+      ...state.toJson(),
+      'value': today,
+      'z': dev == null ? null : _round(dev.z, 3),
+      'delta': dev == null ? null : _round(dev.delta, 3),
+      'ratio': dev == null ? null : _round(dev.ratio, 4),
+      'in_normal_range': dev?.inNormalRange,
+    };
+  }
+
+  // hrv baseline: history + today are BOTH the robust nocturnal RMSSD (the
+  // `rmssd` series), so the center and the value being scored are the same metric.
+  // skin_temp uses the raw-ADC cfg (relative deviation only; no absolute °C).
+  final baselines = <String, dynamic>{
+    'resting_hr':
+        baselineBlock(d.rhrHistory, rhrScalar, Baselines.restingHRCfg),
+    'hrv': baselineBlock(d.rmssdHistory, rmssdScalar, Baselines.hrvCfg),
+    'resp': baselineBlock(d.respHistory, respToday, Baselines.respCfg),
+    'skin_temp':
+        baselineBlock(d.skinTempAdcHistory, skinTempAdc, _skinTempAdcCfg),
+  };
+
   return <String, dynamic>{
     'date': d.date,
     'day_confidence': _round(d.dayConfidence, 4),
     'flags': d.dayFlags,
     'clinical': clinical,
+    'baselines': baselines,
     'sleep': sleep,
     'zones': hrZones,
     'hr_stats': ?hrStats,
@@ -568,6 +643,8 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
       // Headline 0–21 strain (the screens already expect a 0–21 scale); raw
       // Banister TRIMP stays under `trimp` as the secondary "training load".
       'strain': strainScalar,
+      // Secondary 0–100 Edwards "effort" strain (zone-weighted; additive).
+      'strain_effort': effort.present ? effort.value : null,
       'ln_rmssd': lnToday,
       'resp_rate': respToday,
       'skin_temp_z': skinTempZ,
@@ -604,6 +681,13 @@ Map<String, dynamic> deriveDayBundle(Map<String, dynamic> inputJson) {
     },
   };
 }
+
+// Skin-temp baselines operate on RAW nightly ADC means (no absolute °C), so they
+// need a permissive ADC-range cfg — the shipped Baselines.skinTempCfg bounds °C
+// (20–42) and would hard-reject every ADC count. Bounds span the u16 sensor
+// range; the Winsor/outlier logic works off the tracked spread, not these bounds.
+const _skinTempAdcCfg = MetricCfg(
+    minVal: 1, maxVal: 65535, floorSpread: 1.0, halfLifeB: 14, halfLifeS: 21);
 
 // ── helpers (pure) ───────────────────────────────────────────────────────────
 

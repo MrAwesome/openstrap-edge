@@ -24,12 +24,15 @@ import '../models/app_status.dart';
 import '../ble/accessory_setup.dart';
 import '../ble/ble_engine.dart';
 import '../ble/ios_ble_restore.dart';
+import '../cloud/backend_client.dart';
 import '../compute/derivation_engine.dart';
 import '../compute/profile.dart';
 import '../data/db.dart';
 import '../data/local_repository.dart';
 import '../data/local_repository_impl.dart';
 import '../gestures/gesture_settings.dart';
+import '../import/noop_import.dart';
+import '../import/whoop_import.dart';
 import '../gestures/gesture_dispatcher.dart';
 import '../data/models.dart';
 import '../live/live_activity.dart';
@@ -46,7 +49,7 @@ import '../sync/file_log.dart';
 /// Flow: loading → pairing → profile (only if incomplete) → shell. The profile
 /// step collects age/weight/height/sex so the on-device analytics can
 /// personalize (HRmax, calories, TRIMP); it's skipped once those are set.
-enum AppRoute { loading, pairing, profile, shell }
+enum AppRoute { loading, welcome, pairing, profile, shell }
 
 class AppState extends ChangeNotifier {
   late final BleEngine engine;
@@ -117,6 +120,14 @@ class AppState extends ChangeNotifier {
   static const String _kProfile = 'local_profile_json';
   Map<String, dynamic>? user;
 
+  // ── onboarding choice (new vs existing v2 user) ─────────────────────────────
+  // 'new' | 'existing' | null (not chosen yet → the welcome screen shows). Once
+  // set, the welcome screen never reappears (a returning paired user also skips
+  // it). Persisted so a relaunch mid-onboarding doesn't re-prompt.
+  static const String _kOnboard = 'onboarding_choice';
+  String? _onboardChoice;
+  String? get onboardChoice => _onboardChoice;
+
   Future<void> _loadProfile() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(_kProfile);
@@ -125,6 +136,99 @@ class AppState extends ChangeNotifier {
         user = (jsonDecode(raw) as Map).cast<String, dynamic>();
       } catch (_) {/* ignore corrupt blob */}
     }
+    _onboardChoice = prefs.getString(_kOnboard);
+    // Load the user's backend-URL override (if any) so the cloud client resolves
+    // it ahead of the build-time BACKEND_URL.
+    BackendClient.overrideUrl = prefs.getString(_kBackendUrl);
+  }
+
+  // ── backend URL (cloud import / existing-user login) ────────────────────────
+  // Resolved by BackendClient as: this override → build-time BACKEND_URL → empty.
+  static const String _kBackendUrl = 'backend_url';
+
+  /// The effective backend base URL (override or build-time), '' if unconfigured.
+  String get backendUrl => BackendClient.effectiveBase;
+
+  /// True when no backend is configured (no override + no build-time URL).
+  bool get backendConfigured => BackendClient.effectiveBase.trim().isNotEmpty;
+
+  /// Set (or clear, with '') the runtime backend-URL override.
+  Future<void> setBackendUrl(String url) async {
+    final v = url.trim();
+    final prefs = await SharedPreferences.getInstance();
+    if (v.isEmpty) {
+      await prefs.remove(_kBackendUrl);
+      BackendClient.overrideUrl = null;
+    } else {
+      await prefs.setString(_kBackendUrl, v);
+      BackendClient.overrideUrl = v;
+    }
+    notifyListeners();
+  }
+
+  /// New-user path: record the choice and advance (welcome → pairing → profile).
+  Future<void> chooseNewUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kOnboard, 'new');
+    _onboardChoice = 'new';
+    notifyListeners();
+  }
+
+  /// Existing-user path: after a successful cloud import, persist the cloud
+  /// profile + mark onboarding done so the gate advances to pairing → shell.
+  /// [cloudProfile] is the mapped local-profile field set from CloudImporter.
+  Future<void> completeCloudOnboard(Map<String, dynamic> cloudProfile) async {
+    await updateProfile(cloudProfile); // persists + notifies
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kOnboard, 'existing');
+    _onboardChoice = 'existing';
+    notifyListeners();
+  }
+
+  /// Mark onboarding complete after a file import (welcome → import flow). No-op
+  /// if a choice was already made (a returning user importing from Profile). The
+  /// route then advances past `welcome` to pairing → profile → shell.
+  Future<void> completeImportOnboard() async {
+    if (_onboardChoice != null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kOnboard, 'imported');
+    _onboardChoice = 'imported';
+    notifyListeners();
+  }
+
+  // ── data imports (NOOP raw CSV / Edge backup / WHOOP export) ────────────────
+  // Reachable from onboarding AND Profile (a returning user is past the welcome
+  // gate). Each runs against the engine + local profile, then notifies so every
+  // screen re-reads the freshly imported days.
+
+  /// NOOP raw-sensor CSV → FULL 1 Hz re-derivation (memory-bounded streaming).
+  Future<int> importNoopCsv(String path,
+      {void Function(int days)? onProgress}) async {
+    final res = await NoopImporter.importFile(path, _profile, _derive,
+        onProgress: onProgress);
+    notifyListeners();
+    return res.days;
+  }
+
+  /// WHOOP export CSV(s) → derived-snapshot days (+ workouts). BETA.
+  Future<int> importWhoopCsvs(List<String> paths,
+      {void Function(int days)? onProgress}) async {
+    final res = await WhoopImporter.importFiles(paths,
+        engine: _derive, profile: _profile, onProgress: onProgress);
+    notifyListeners();
+    return res.days;
+  }
+
+  /// Another device's exported OpenStrap DB (.db) → merge into the local store.
+  /// Returns total rows copied across tables.
+  Future<int> importEdgeBackup(String path) async {
+    final counts = await LocalDb.importFromDbFile(path);
+    // Imported rows include derived day_result/metric_series → refresh rollups.
+    try {
+      await _derive.finalizeImport(_profile);
+    } catch (_) {/* best-effort */}
+    notifyListeners();
+    return counts.values.fold<int>(0, (a, b) => a + b);
   }
 
   /// Merge + persist local profile fields. Returns the updated map. Replaces the
@@ -142,6 +246,8 @@ class AppState extends ChangeNotifier {
   Future<void> signOut() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kProfile);
+    await prefs.remove(_kOnboard);
+    _onboardChoice = null;
     user = null;
     await unpair();
   }
@@ -152,6 +258,10 @@ class AppState extends ChangeNotifier {
   /// and starve the background BLE connection.
   AppRoute get route {
     if (!initialized) return AppRoute.loading;
+    // First run, fresh install: offer "existing v2 user vs new user" before we
+    // ask anyone to pair. A returning (already-paired) user skips it even if the
+    // choice flag predates this build.
+    if (_onboardChoice == null && !isPaired) return AppRoute.welcome;
     if (!isPaired) return AppRoute.pairing;
     if (!profileComplete) return AppRoute.profile;
     return AppRoute.shell;

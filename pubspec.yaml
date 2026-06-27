@@ -53,6 +53,9 @@ dependencies:
   # Share recap cards (rendered card → image → share sheet).
   share_plus: ^10.1.4
 
+  # File picker for data imports (NOOP raw CSV, Edge .db backup, WHOOP export CSV).
+  file_picker: ^8.1.6
+
   # Home/lock-screen widget bridge (writes a snapshot to the App Group → WidgetKit).
   home_widget: ^0.6.0
 

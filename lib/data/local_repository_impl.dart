@@ -72,6 +72,20 @@ class LocalRepositoryImpl extends LocalRepository {
     return _decode(r?['payload_json']);
   }
 
+  /// True when [date] is today's (UTC) label — the only case where a missing
+  /// derived row should fall back to the latest complete day. The screens pass
+  /// `todayUtc()` for the Today tab; historical drill-downs pass an exact past
+  /// date, which must NEVER fall back (else every empty day renders the latest
+  /// day's data — the "stage minutes show the latest night" bug).
+  bool _isTodayLabel(String date) =>
+      date == DateTime.now().toUtc().toIso8601String().substring(0, 10);
+
+  /// The bundle for a requested date: the exact day's row, or — only for the
+  /// Today request — the latest complete day. A historical date with no row
+  /// returns null (→ the caller's honest empty shape), not the latest.
+  Future<Map<String, dynamic>?> _bundleForDate(String date) async =>
+      await _bundle(date) ?? (_isTodayLabel(date) ? await _latestBundle() : null);
+
   static Map<String, dynamic>? _decode(Object? json) {
     if (json is! String) return null;
     try {
@@ -301,7 +315,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayHeart(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     final hrCurve = (_sub(b, 'series')?['hr_curve'] as List?) ?? const [];
     final rmssd = _scalar(b, 'rmssd');
@@ -322,6 +336,9 @@ class LocalRepositoryImpl extends LocalRepository {
       },
       // Poincaré irregular-beat screen (sd1/sd2/flag/confidence).
       'irregular': _sub(b, 'clinical')?['irregular'],
+      // Winsorized-EWMA personal baselines (rhr/hrv/resp/skin_temp) — robust
+      // center + spread + z + cold-start status for each.
+      'baselines': b['baselines'],
       // Waking ultradian HRV timeline (RMSSD over the day, outside sleep).
       'daytime_hrv': b['daytime_hrv'],
       'nocturnal': _nocturnal(b, baselineRhr: await _seriesMean('rhr')),
@@ -335,7 +352,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayHrv(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     return {
       'timeline': (_sub(b, 'series')?['hrv_timeline'] as List?) ?? const [],
@@ -357,7 +374,7 @@ class LocalRepositoryImpl extends LocalRepository {
   Future<Map<String, dynamic>> getDaySleepV2(String date) => _daySleep(date);
 
   Future<Map<String, dynamic>> _daySleep(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     // Each is a Metric envelope — read the inner `.value` where the fields live.
     final acct = _sub(b, 'sleep.accounting.value');
@@ -413,6 +430,10 @@ class LocalRepositoryImpl extends LocalRepository {
       'cycles_mean_min': _cyclesMeanMin(b),
       // The graph plots the continuous z-RMSSD wave [{t,z}] — NOT the cycle spans.
       'cycle_series': _sub(b, 'sleep')?['cycle_series'] ?? const [],
+      // Parallel 4-class AASM read (Cole–Kripke/DoG stager): SOL / REM-latency /
+      // disturbances + stage minutes + hypnogram. ESTIMATE; the headline stages
+      // above stay the single source. {present:false} when none qualifies.
+      'advanced': b['advanced_sleep'],
     };
   }
 
@@ -447,7 +468,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayLungs(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     return {
       'resp': _respObj(b),
@@ -458,7 +479,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayWear(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     final cov = _sub(b, 'coverage');
     final valid = (cov?['hr_valid'] as num?)?.toInt() ?? 0;
@@ -484,7 +505,7 @@ class LocalRepositoryImpl extends LocalRepository {
     // tension; transparent RR-histogram metric → 0–100 score). Falls back to the
     // readiness inverse only if SI is absent. Nocturnal arousal isn't computed,
     // so `sleep_stress` is intentionally absent (the screen handles it).
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
 
     final stressBlk =
@@ -540,7 +561,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayStrain(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     final zones = _sub(b, 'zones');
     final hrStats = _sub(b, 'hr_stats');
@@ -553,6 +574,8 @@ class LocalRepositoryImpl extends LocalRepository {
       // TRIMP is kept as the secondary "training load" figure.
       'strain': _scalar(b, 'strain'),
       'training_load': _scalar(b, 'trimp'),
+      // Secondary 0–100 Edwards "effort" strain (zone-weighted, per-second wake HR).
+      'effort': _scalar(b, 'strain_effort'),
       'load': ?cd?['load'], // {acwr, acute, chronic, band} when ≥ history exists
       // HR-zone minutes (Z1–Z5 by %HRmax) — the strain detail's zone bars.
       'zones': {
@@ -576,7 +599,7 @@ class LocalRepositoryImpl extends LocalRepository {
 
   @override
   Future<Map<String, dynamic>> getDayTimeline(String date) async {
-    final b = await _bundle(date) ?? await _latestBundle();
+    final b = await _bundleForDate(date);
     if (b == null) return const {};
     final hrCurve = (_sub(b, 'series')?['hr_curve'] as List?) ?? const [];
 

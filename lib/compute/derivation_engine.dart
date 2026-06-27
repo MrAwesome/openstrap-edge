@@ -94,7 +94,15 @@ import 'substrate.dart';
 /// curve, no derived change.)
 /// v15: efficiency + worn_min scalars → metric_series (sleep-efficiency & wear
 /// trends); + _trendKey fixes (resting_hr→rhr, skin_temp→skin_temp_z, sleep→tst_min).
-const int kAlgoVersion = 15;
+/// v16: ADDITIVE analytics surfaced into the bundle — (a) `clinical.strain_effort`
+/// + `scalars.strain_effort`: a 0–100 Edwards zone-sum "effort" strain (Karvonen
+/// %HRR over the per-second wake HR) beside the 0–21 headline; (b) top-level
+/// `baselines` block: Winsorized-EWMA personal baselines (rhr/hrv/resp) with
+/// z/delta/ratio + cold-start status; (c) `advanced_sleep` block: a 4-class
+/// Cole–Kripke/DoG stager's main-session AASM metrics + hypnogram (parallel
+/// ESTIMATE; the single-source `sleep` block stays the headline). Bumping
+/// re-derives non-finalized recent days so the new blocks populate.
+const int kAlgoVersion = 16;
 
 /// Raw is kept this many days past derivation, then pruned (derived stays).
 const int rawRetentionDays = 14;
@@ -332,10 +340,53 @@ class DerivationEngine {
   /// skipped so the sweep always makes progress.
   static const Duration _perDayTimeout = Duration(seconds: 90);
 
+  // ── imports (derive from a pre-built substrate, not from stored raw) ─────────
+
+  /// Derive the named [dates] from a caller-supplied [sub] (e.g. a CSV import
+  /// rebuilt into a Substrate), reusing the FULL per-day pipeline (sleep / HRV /
+  /// strain / workouts / advanced_sleep) — so imported raw 1 Hz gets the exact
+  /// same analytics as a live band sync. [sub] should span the requested dates
+  /// PLUS the prior evening (a night's sleep starts before midnight, and the day
+  /// model searches `prev 18:00 → noon`); the caller windows the stream so memory
+  /// stays bounded. Each derived day is FORCE-FINALIZED (imports are immutable
+  /// snapshots — there is no stored raw to recompute them from). Returns the
+  /// number of days written. Does NOT prune raw or run the cross-day rollup —
+  /// call [finalizeImport] once after all windows.
+  Future<int> deriveImportedDays(
+    Substrate sub,
+    Profile profile,
+    Set<String> dates, {
+    void Function(String day)? onDayDone,
+  }) async {
+    if (sub.isEmpty || dates.isEmpty) return 0;
+    final days = calendarDays(sub);
+    final dataNowSec = sub.lastTs ?? 0;
+    var done = 0;
+    for (final day in days) {
+      if (!dates.contains(day.date)) continue;
+      try {
+        await _deriveDay(sub, day, profile, dataNowSec, forceFinalize: true);
+        done++;
+        onDayDone?.call(day.date);
+      } catch (e) {
+        _log('import day ${day.date} FAILED/skipped: $e');
+      }
+    }
+    return done;
+  }
+
+  /// Run the cross-day rollup + notifications + baseline refresh once after an
+  /// import completes (reflects the freshly imported day history).
+  Future<void> finalizeImport(Profile profile) async {
+    await _runCrossDay(profile);
+    await _runNotifications();
+  }
+
   // ── derive one day ──────────────────────────────────────────────────────────
 
   Future<void> _deriveDay(
-      Substrate sub, PhysioDay day, Profile profile, int dataNowSec) async {
+      Substrate sub, PhysioDay day, Profile profile, int dataNowSec,
+      {bool forceFinalize = false}) async {
     // Slice the substrate to the day container and to the SLEEP window.
     final daySub = sub.slice(day.startSec, day.endSec);
     final sleepSub = day.hasSleep
@@ -433,10 +484,20 @@ class DerivationEngine {
     bundle['detected_workouts'] =
         await _detectedWorkouts(daySub, day, profile);
 
+    // ── ADVANCED SLEEP (4-class Cole–Kripke + DoG/percentile stager) ─────────
+    // A richer, AASM-style sleep read (SOL / REM-latency / disturbances + a
+    // 4-class hypnogram) computed over the day substrate (needs accel, which
+    // lives here, not in the bundle input). ADDITIVE: the canonical single-source
+    // `sleep` block (from segmentSleep) is the headline; this is a parallel
+    // ESTIMATE detail. Best-effort — never throws.
+    bundle['advanced_sleep'] = await _advancedSleep(daySub);
+
     // Finalize once the DATA EDGE has moved >48 h past the day's wake — i.e. we
     // have continuous drained data well beyond it, so no more flash can land for
-    // this day. (Anchored on the last record ts, NOT the wall clock.)
-    final finalized = (day.endSec + _finalizationSec) < dataNowSec;
+    // this day. (Anchored on the last record ts, NOT the wall clock.) Imports
+    // force-finalize: there is no stored raw to ever recompute them from.
+    final finalized =
+        forceFinalize || (day.endSec + _finalizationSec) < dataNowSec;
 
     final scalars = (bundle['scalars'] as Map?)?.cast<String, dynamic>() ?? const {};
     double? sc(String k) => (scalars[k] as num?)?.toDouble();
@@ -465,6 +526,8 @@ class DerivationEngine {
         // Headline 0–21 strain (for trend/sparkline); raw TRIMP kept too.
         'strain': sc('strain'),
         'trimp': sc('trimp'),
+        // Secondary 0–100 Edwards "effort" strain → its own trend series.
+        'strain_effort': sc('strain_effort'),
         'odi_per_hour': sc('odi_per_hour'),
         'cpc_ratio': sc('cpc_ratio'),
         // New metrics → trends (day/week/month/3M).
@@ -512,6 +575,9 @@ class DerivationEngine {
     m['ln_rmssd_history'] = await hist('ln_rmssd');
     m['rhr_history'] = await hist('rhr');
     m['resp_history'] = await hist('resp_rate');
+    // Robust nocturnal RMSSD history (the `rmssd` series) — feeds the EWMA hrv
+    // baseline so its center matches today's headline RMSSD (same metric).
+    m['rmssd_history'] = await hist('rmssd');
     // BASELINE for skin_temp_z is the RAW nightly ADC-mean series (`skin_temp_adc`),
     // NOT the z-score series. Feeding z-scores back as the baseline was a unit
     // mismatch that left z permanently null. The raw mean is stored every day so
@@ -624,12 +690,18 @@ class DerivationEngine {
     num? sc(String k) => scalars[k] is num ? scalars[k] as num : null;
     num? col(String k) => row[k] is num ? row[k] as num : null;
 
-    final sleep = (payload['sleep'] as Map?)?.cast<String, dynamic>();
-    final win = (sleep?['window'] as Map?)?.cast<String, dynamic>();
-    final winVal = (win?['value'] as Map?)?.cast<String, dynamic>();
-    final acct = (sleep?['accounting'] as Map?)?.cast<String, dynamic>();
-    final acctVal = (acct?['value'] as Map?)?.cast<String, dynamic>();
-    final series = (payload['series'] as Map?)?.cast<String, dynamic>();
+    // Safe map cast: a metric envelope's `value` is the string '—' when the
+    // metric is ABSENT (e.g. a no-sleep day), so a blind `as Map?` throws. Only
+    // treat it as a map when it really is one.
+    Map<String, dynamic>? asMap(Object? v) =>
+        v is Map ? v.cast<String, dynamic>() : null;
+
+    final sleep = asMap(payload['sleep']);
+    final win = asMap(sleep?['window']);
+    final winVal = asMap(win?['value']);
+    final acct = asMap(sleep?['accounting']);
+    final acctVal = asMap(acct?['value']);
+    final series = asMap(payload['series']);
 
     final onsetMs = (winVal?['onset_ms'] as num?)?.toDouble();
     final offsetMs = (winVal?['offset_ms'] as num?)?.toDouble();
@@ -783,6 +855,60 @@ class DerivationEngine {
     } catch (e) {
       _log('detected-workouts ${day.date} skipped: $e');
       return const [];
+    }
+  }
+
+  /// Advanced 4-class sleep over the day substrate via [ana.AdvancedSleepStager]
+  /// (Cole–Kripke sleep/wake spine + DoG HR-variability + percentile-band
+  /// classifier + median/physiology smoothing). Returns the MAIN sleep session's
+  /// AASM metrics (TST/SOL/REM-latency/WASO/disturbances + per-stage minutes) and
+  /// a 4-class hypnogram. ADDITIVE — the canonical `sleep` block stays the
+  /// single source; this is a parallel ESTIMATE. `{present:false}` when no
+  /// qualifying sleep / insufficient data. Never throws (best-effort detail).
+  Future<Map<String, dynamic>> _advancedSleep(Substrate s) async {
+    try {
+      if (s.length < 600) return const {'present': false};
+      // Snapshot the primitive arrays (sendable) and run the heavy detect+stage
+      // pipeline OFF the main isolate so a heavy/rescan sweep never janks the UI.
+      final ts = s.tsSec, hr = s.hr, ax = s.ax, ay = s.ay, az = s.az;
+      final rrTs = s.rrTsMs, rrMs = s.rrMs;
+      final tz = DateTime.now().timeZoneOffset.inSeconds;
+      return await Isolate.run(() {
+        final grav = <ana.GravTs>[
+          for (var i = 0; i < ts.length; i++) ana.GravTs(ts[i], ax[i], ay[i], az[i])
+        ];
+        final hrTs = <ana.HrTs>[
+          for (var i = 0; i < ts.length; i++)
+            if (hr[i] > 0) ana.HrTs(ts[i], hr[i].toDouble())
+        ];
+        // Sparse RR anchored at each beat's record second.
+        final rr = <ana.RrTs>[
+          for (var i = 0; i < rrMs.length; i++)
+            ana.RrTs((rrTs[i] / 1000).round(), rrMs[i])
+        ];
+        final m = ana.AdvancedSleepStager.mainSleep(grav, hrTs,
+            rr: rr, tzOffsetSec: tz);
+        if (!m.present) {
+          return <String, dynamic>{'present': false, 'note': m.note};
+        }
+        final sess = m.value!;
+        final hm = ana.AdvancedSleepStager.hypnogramMetrics(sess);
+        return <String, dynamic>{
+          'present': true,
+          'start': sess.start,
+          'end': sess.end,
+          'efficiency': sess.efficiency,
+          'resting_hr': sess.restingHr,
+          'avg_hrv': sess.avgHrv,
+          'confidence': m.confidence,
+          'tier': m.tier,
+          'metrics': hm.toJson(),
+          'hypnogram': [for (final st in sess.stages) st.toJson()],
+        };
+      }).timeout(_perDayTimeout);
+    } catch (e) {
+      _log('advanced-sleep skipped: $e');
+      return const {'present': false};
     }
   }
 

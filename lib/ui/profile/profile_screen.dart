@@ -5,16 +5,18 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../data/db.dart';
 import '../../state/app_state.dart';
 import '../../state/units_controller.dart';
 import '../../theme/theme.dart';
 import '../../theme/theme_switcher.dart';
 import '../../theme/tokens.dart';
+import '../import/import_screen.dart';
 import '../kit/kit.dart';
 import '../today/step_goal_screen.dart';
-import '../debug/diagnostics_screen.dart';
 import 'gesture_section.dart';
 import 'notification_relay_section.dart';
 
@@ -143,6 +145,31 @@ class ProfileScreen extends StatelessWidget {
             padding: const EdgeInsets.symmetric(
                 horizontal: Sp.x5, vertical: Sp.x2),
             child: DetailRow(
+              icon: Ic.cloud,
+              label: 'Import data',
+              value: 'NOOP · Edge · WHOOP',
+              onTap: () => Navigator.of(context)
+                  .push(themedRoute((_) => const ImportScreen())),
+            ),
+          ),
+          const SizedBox(height: Sp.x3),
+          ProCard(
+            padding: const EdgeInsets.symmetric(
+                horizontal: Sp.x5, vertical: Sp.x2),
+            child: DetailRow(
+              icon: Ic.cloud,
+              label: 'Backend URL',
+              value: app.backendConfigured
+                  ? _shortUrl(app.backendUrl)
+                  : 'Not set',
+              onTap: () => _editBackendUrl(context, app),
+            ),
+          ),
+          const SizedBox(height: Sp.x3),
+          ProCard(
+            padding: const EdgeInsets.symmetric(
+                horizontal: Sp.x5, vertical: Sp.x2),
+            child: DetailRow(
               icon: Ic.history,
               label: 'Re-analyze data',
               value: app.reanalyzing
@@ -163,15 +190,35 @@ class ProfileScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: Sp.x3),
+          // Export the local SQLite store (transactionally-consistent VACUUM INTO
+          // snapshot) via the share sheet — for backup, moving to a new device
+          // ("Import from Edge"), or sharing for debugging.
           ProCard(
             padding: const EdgeInsets.symmetric(
                 horizontal: Sp.x5, vertical: Sp.x2),
-            child: DetailRow(
-              icon: Ic.info,
-              label: 'Diagnostics',
-              value: 'View',
-              onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => const DiagnosticsScreen())),
+            child: Builder(
+              builder: (rowCtx) => DetailRow(
+                icon: Ic.cloud,
+                label: 'Export data (.db)',
+                value: 'Share',
+                onTap: () async {
+                  final messenger = ScaffoldMessenger.of(rowCtx);
+                  final box = rowCtx.findRenderObject() as RenderBox?;
+                  try {
+                    final path = await LocalDb.exportCopy();
+                    await Share.shareXFiles(
+                      [XFile(path)],
+                      text: 'OpenStrap data export',
+                      sharePositionOrigin: box != null
+                          ? box.localToGlobal(Offset.zero) & box.size
+                          : null,
+                    );
+                  } catch (e) {
+                    messenger.showSnackBar(
+                        SnackBar(content: Text('Export failed: $e')));
+                  }
+                },
+              ),
             ),
           ),
 
@@ -401,6 +448,62 @@ class ProfileScreen extends StatelessWidget {
   static String _sexLabel(String? s) {
     if (s == null || s.isEmpty) return 'Add';
     return s[0].toUpperCase() + s.substring(1);
+  }
+
+  /// Compact host for the row value (drop scheme + trailing path).
+  static String _shortUrl(String url) {
+    var u = url.replaceFirst(RegExp(r'^https?://'), '');
+    final slash = u.indexOf('/');
+    if (slash > 0) u = u.substring(0, slash);
+    return u;
+  }
+
+  /// Edit the cloud backend URL (used by existing-user login / cloud import).
+  /// Blank clears the override → falls back to the build-time BACKEND_URL.
+  Future<void> _editBackendUrl(BuildContext context, AppState app) async {
+    final ctrl = TextEditingController(text: app.backendUrl);
+    final messenger = ScaffoldMessenger.of(context);
+    final url = await showDialog<String>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('Backend URL'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+                'Where existing-user login + cloud import connect. Leave blank to '
+                'use the build default.',
+                style: AppText.captionMuted),
+            const SizedBox(height: Sp.x3),
+            TextField(
+              controller: ctrl,
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                hintText: 'https://your-worker.workers.dev',
+                isDense: true,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(dctx).pop(),
+              child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.of(dctx).pop(ctrl.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (url == null) return; // cancelled
+    await app.setBackendUrl(url);
+    messenger.showSnackBar(SnackBar(
+        content: Text(url.isEmpty
+            ? 'Backend URL cleared — using the build default.'
+            : 'Backend URL saved.')));
   }
 
   // ── Profile edit sheet ────────────────────────────────────────────────
